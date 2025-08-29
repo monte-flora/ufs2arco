@@ -79,10 +79,11 @@ class Target:
         self.store_path = store_path
         self.chunks = chunks
         self.rename = rename if rename is not None else dict()
-
+        
         # set these for different source handling
         self._has_fhr = getattr(self.source, "fhr", None) is not None
-        self._has_member = getattr(self.source, "member", None) is not None
+        self._has_member = getattr(self.source, "member", None) is not None 
+        self._has_lead_time = getattr(self.source, "lead_time", None) is not None
 
         # check chunks
         for dim in self.renamed_sample_dims:
@@ -102,7 +103,6 @@ class Target:
             self.forcings = forcings
         else:
             self.forcings = tuple()
-
         # statistics
         # For now, only implemented in anemoi target
         if "anemoi" not in self.name.lower() and statistics_period is not None:
@@ -193,7 +193,7 @@ class Target:
 
     def compute_forcings(self, xds: xr.Dataset) -> xr.Dataset:
 
-        time = "valid_time" if self._has_fhr else "time"
+        time = "valid_time" if self._has_fhr or self._has_lead_time else "time"
         mappings = fmod.get_mappings(time=time)
         for key in self.forcings:
 

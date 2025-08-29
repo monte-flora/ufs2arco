@@ -7,6 +7,7 @@ import os
 import logging
 import yaml
 from datetime import datetime
+import datetime as dt_cls
 
 import numpy as np
 import xarray as xr
@@ -21,6 +22,16 @@ import ufs2arco.targets
 from ufs2arco.datamover import DataMover, MPIDataMover
 
 logger = logging.getLogger("ufs2arco")
+
+def make_json_safe(obj):
+    if isinstance(obj, (dt_cls.date, datetime, pd.Timestamp, np.datetime64)):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(v) for v in obj]
+    return obj
+
 
 class Driver:
     """A class to manage data movement.
@@ -263,7 +274,6 @@ class Driver:
 
             xds = next(self.mover)
 
-
             # xds is None if MPI rank looks for non existent indices (i.e., last batch scenario)
             # len(xds) == 0 if we couldn't find the file we were looking for
             has_content = xds is not None and len(xds) > 0
@@ -336,7 +346,7 @@ class Driver:
         logger.info(f"Storing the recipe and anything from the 'attrs' section in zarr store attributes")
         if self.topo.is_root:
             zds = zarr.open(self.store_path, mode="a")
-            zds.attrs["recipe"] = self.config
+            zds.attrs["recipe"] = make_json_safe(self.config)
             if "attrs" in self.config.keys():
                 for key, val in self.config["attrs"].items():
                     zds.attrs[key] = val

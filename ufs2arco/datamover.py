@@ -119,6 +119,8 @@ class DataMover():
                         fds = self.transformer(fds)
                         fds = self.target.apply_transforms_to_sample(fds)
                         dlist.append(fds)
+                        
+                
                 if len(dlist) == 1:
                     xds = dlist[0]
                 else:
@@ -221,7 +223,7 @@ class DataMover():
                 dims=dims,
                 attrs=xds[varname].attrs.copy(),
             )
-
+            
         return nds
 
 
@@ -236,10 +238,12 @@ class DataMover():
             region (dict): indicating the zarr region to store in, based on the initial condition indices
         """
         region = {k: slice(None, None) for k in xds.dims}
+        
         for key in self.target.renamed_sample_dims:
             full_array = getattr(self.target, key) # e.g. all of the initial conditions
             batch_indices = [list(full_array).index(value) for value in xds[key].values]
             region[key] = slice(batch_indices[0], batch_indices[-1]+1)
+
         return region
 
 

@@ -228,9 +228,7 @@ class MultiDriver(Driver):
 
             # we need both conditionals, since all([]) == True
             if all(foundit) and len(foundit) == len(self.movers):
-
                 mds = self.target.merge_multisource(dslist)
-
                 region = self.mover.find_my_region(mds)
                 mds.to_zarr(self.target.store_path, region=region)
 
