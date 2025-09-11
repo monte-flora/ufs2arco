@@ -154,6 +154,12 @@ class AWSGRAFArchive(Source):
         "05m" : "05min"
              }
     
+    STATIC_VAR_RENAMER = {
+        'ter' : 'surface_elevation', 
+        'landmask' : 'land_sea_mask', 
+        'soiltemp' : 'climo_soiltemp'
+    } 
+    
     @property
     def name(self) -> str:
         return self.__class__.__name__
@@ -180,11 +186,11 @@ class AWSGRAFArchive(Source):
         init_time : dict[Literal["start", "stop"], str],
         lead_times : dict[Literal["start", "stop"], str],
         variables : Optional[dict] = None, 
+        static_variables : list = None, 
         levels : Optional[list | tuple] = None, 
         geographic_extent = dict[Literal["lat_min", "lat_max", "lon_min", "lon_max"], float],
         static_file_path : str = None, 
         destagger_kwargs = None, 
-        add_static_vars : bool = True,
         temporal_aggregate_kwargs : dict = None,
     )-> None:
         """
@@ -196,13 +202,16 @@ class AWSGRAFArchive(Source):
             variables : dict 
                 Variables to grab to grab from the 15min and 5min datasets
                 keys are "15m" and "05m"
+            static_variables: list of strs
+                Static variables to grab from the static netcdf file. 
             levels : list/tuple
                 Vertical levels to grab 
             lead_times : dict 
                 Dictionary with start and top of a time range
                 to select lead times to grab. Times must be
-                expressed as timedeltas 
+                expressed as timedeltas. 
                 (e.g., lead_times = {"start" : "15min", "stop": "3h"}) 
+                Can grab different lead time ranges based on initialization cycle. 
             geographic_extent : dict 
                 Dictionary expressing lat/lon min and maxes
                 for region to grab
@@ -210,8 +219,6 @@ class AWSGRAFArchive(Source):
                 Path to the static variables 
             destagger_kwargs : dict (default=None)
                 If provided, used to destagger variables (horizontally or vertically) 
-            add_static_vars : bool (default=True) 
-                Whether to add static variables to output dataset 
             temporal_aggregate_kwargs : dict (default=None)
                 If provided, used to temporally aggregated data. 
                 Primary used for aggregating the 5min data to the 15min data.
@@ -234,23 +241,23 @@ class AWSGRAFArchive(Source):
         self.init_time_dts = pd.to_datetime(self.init_times_df.index)
        
         self.variables = variables
+        self.static_variables = static_variables 
         self.levels = levels 
         self.lead_times = lead_times 
         self.geographic_extent = geographic_extent
         self.static_file_path = static_file_path 
         self.destagger_kwargs = destagger_kwargs 
-        self.add_static_vars = add_static_vars
         self.temporal_aggregate_kwargs = temporal_aggregate_kwargs
         self._load_static_file(static_file_path)
         
         # Precompute valid_time coordinate
         self.valid_times = self._compute_valid_times()
-    
+    '''
     def _compute_valid_times(self) -> pd.DatetimeIndex:
         """Expand init_times × lead_times into a flat 1D valid_time index."""
-        if not {"start", "stop"} <= set(self.lead_times):
-            raise ValueError("lead_times must include 'start' and 'stop' keys")
 
+        print(self.init_times_df)
+        
         # Parse lead_time start/stop into Timedelta
         lt_start = pd.to_timedelta(self.lead_times["start"])
         lt_stop = pd.to_timedelta(self.lead_times["stop"])
@@ -259,6 +266,8 @@ class AWSGRAFArchive(Source):
         # Number of forecast steps per init_time
         n_steps = int(((lt_stop - lt_start) / freq) + 1)
 
+
+        
         all_valid_times = []
         for init in self.init_times_df.index:
             # start forecast clock from init + lt_start
@@ -268,7 +277,39 @@ class AWSGRAFArchive(Source):
 
         # Flatten into one continuous index
         return pd.DatetimeIndex(np.concatenate(all_valid_times))
+    '''
+    def _compute_valid_times(self) -> pd.DatetimeIndex:
+        """Expand init_times × cycle-based lead_times into a flat 1D valid_time index."""
+        freq = pd.to_timedelta(self.FREQ)
+        all_valid_times = []
+        
+        for init, row in self.init_times_df.iterrows():
+            # extract cycle from "case" column (e.g., '2004010112_27')
+            cycle = str(row["case"].split('_')[0][-2:])  # last 2 chars before underscore
 
+            # Parse cycle-specific lead time range
+            lt_cfg = self.lead_times.get(cycle, None)
+            if lt_cfg is None:
+                start = "6h"
+                stop = "12h"
+                lt_start = pd.to_timedelta("6h")
+                lt_stop = pd.to_timedelta("12h")
+            else:
+                lt_start = pd.to_timedelta(lt_cfg["start"])
+                lt_stop = pd.to_timedelta(lt_cfg["stop"])
+
+            # number of forecast steps for this init_time
+            n_steps = int(((lt_stop - lt_start) / freq) + 1)
+
+            # valid times for this init_time
+            start_time = init + lt_start
+            times = pd.date_range(start=start_time, periods=n_steps, freq=freq)
+            all_valid_times.append(times)
+
+        # Flatten into one continuous index
+        return pd.DatetimeIndex(np.concatenate(all_valid_times))
+    
+    
     def __str__(self) -> str:
         attrslist = ["init_time", "valid_times"] + [
             #"init_time", this is the sample dim
@@ -294,32 +335,31 @@ class AWSGRAFArchive(Source):
                
     def _load_static_file(self, static_file_path):
         """Load the static netcdf file with latitude and longitude cell values"""
-        static_nc = netCDF4.Dataset(static_file_path, 'r')
-        cell_lat_rads = static_nc.variables['latCell'][:] 
-        cell_lon_rads = static_nc.variables['lonCell'][:]
+        with netCDF4.Dataset(static_file_path, 'r') as static_ds:
+            cell_lat_rads = static_ds.variables['latCell'][:] 
+            cell_lon_rads = static_ds.variables['lonCell'][:]
         
-        # The MPAS lat/lon values are stored in radians. 
-        # Convert back to degrees for ease of setting 
-        # the geographic extent. 
-        lat, lon = spherical_to_lat_lon(
-            phi = cell_lon_rads,
-            theta = cell_lat_rads, 
-            invert_lat = False 
-        )
+            # The MPAS lat/lon values are stored in radians. 
+            # Convert back to degrees for ease of setting 
+            # the geographic extent. 
+            lat, lon = spherical_to_lat_lon(
+                phi = cell_lon_rads,
+                theta = cell_lat_rads, 
+                invert_lat = False 
+            )
         
-        self.lat_lon = {
-            # Keeping the cell latitude and longitude in degrees
-            # to be consistent with anemoi framework.
-            'latitude' : lat,
-            'longitude' : lon }
+            self.lat_lon = {
+                # Keeping the cell latitude and longitude in degrees
+                # to be consistent with anemoi framework.
+                'latitude' : lat,
+                'longitude' : lon }
         
-        self.static_vars = {
-            'surface_elevation' : static_nc.variables['ter'][:],
-            'land_sea_mask' : static_nc.variables['landmask'][:],
-        }
+            self.static_vars = {}
+            for v in self.static_variables:
+                name = self.STATIC_VAR_RENAMER.get(v, v)
+                self.static_vars[name] = static_ds.variables[v][:]
         
-        self.variables["15m"] += list(self.lat_lon.keys())
-        if self.add_static_vars:
+            self.variables["15m"] += list(self.lat_lon.keys())
             self.variables["15m"] += list(self.static_vars.keys())
 
                 
@@ -401,6 +441,9 @@ class AWSGRAFArchive(Source):
         if "level" in xds.dims:
             xds = xds.isel(level=self.levels) 
         
+        if "nSoilLevels" in xds.dims:
+            xds = xds.isel(nSoilLevels=0)
+        
         return xds
 
     def select_by_lead_times(self,
@@ -439,7 +482,7 @@ class AWSGRAFArchive(Source):
             os.remove(permutation_path)
             
         return xds_dict
-                               
+    
     def open_sample_dataset(
         self, 
         dims : dict, 
@@ -460,7 +503,6 @@ class AWSGRAFArchive(Source):
             )
         
         xds_dict = self.apply_temp_time_reordering(xds_dict, paths)
-        
         
         # Add the latitude and longitudes
         # and optionally add static variables. 
@@ -499,9 +541,11 @@ class AWSGRAFArchive(Source):
         xds = self.select_levels(xds)  
                 
         if self.lead_times is not None:
+            # '2012010312_27' -> '12' 
+            cycle = dims['init_time'].split('_')[0][-2:]
             xds = self.select_by_lead_times(xds, 
-                                      self.lead_times["start"],
-                                      self.lead_times["stop"],
+                                      self.lead_times[cycle]["start"],
+                                      self.lead_times[cycle]["stop"],
                                       )
             
         # Drop the time coordinate values.
