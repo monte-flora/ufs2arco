@@ -58,38 +58,32 @@ def spherical_to_lat_lon(
 
 def temporal_aggregate(xds: xr.Dataset, 
                        var_to_stat_mapping : dict, 
-                       coarsen_kwargs : dict = dict(lead_time=3, boundary='trim', side='right'),
+                       resample_kwargs : dict = dict(time="15min"),
     ) -> xr.Dataset:
-    data_vars = xds.data_vars
-        
+    data_vars = list(xds.data_vars) 
+    xds = xds.assign_coords(time=xds.valid_time.values)
+    
     outs = []
     for stat, vars_ in var_to_stat_mapping.items():
         if not vars_:
             continue
+            
         vs = [v for v in vars_ if v in data_vars]   
         if len(vs) == 0:
-            continue
-                
+            continue                
         sub = xds[vs]
             
         if stat == "sum":
-            outs.append(sub.coarsen(**coarsen_kwargs).sum(keep_attrs=True))
+            outs.append(sub.resample(**resample_kwargs).sum(keep_attrs=True))
         elif stat == "max":
-            outs.append(sub.coarsen(**coarsen_kwargs).max(keep_attrs=True))
+            outs.append(sub.resample(**resample_kwargs).max(keep_attrs=True))
         elif stat == "mean":
-            outs.append(sub.coarsen(**coarsen_kwargs).mean(keep_attrs=True))
+            outs.append(sub.resample(**resample_kwargs).mean(keep_attrs=True))
  
         xds_out = xr.merge(outs)
-
-        xds_out = xds_out.transpose("init_time", "lead_time", ...)
+        xds_out = xds_out.transpose("time", ...)
         
-       
-        # TODO: Hardcoding these variables back in.
-        xds_out['latitude'] = xds['latitude']
-        xds_out['longitude'] = xds['longitude']
-        
-        
-        return xds_out
+    return xds_out
 
 def is_valid_basename(name: str) -> bool:
     pattern = re.compile(r"^\d{10}_\d+$")
@@ -109,8 +103,9 @@ def get_date_iter(bucket : str, start : str, stop : str)->pd.DataFrame:
         yyyymmdd = casestr [:8]
         hh = casestr [8:10]     # init hour
         fh = casestr .split("_")[-1]  # forecast length
-        init_time = pd.to_datetime(yyyymmdd + hh, format="%Y%m%d%H")
-        return init_time, int(fh), casestr 
+        init_time_dt = pd.to_datetime(yyyymmdd + hh, format="%Y%m%d%H")
+        
+        return init_time_dt, int(fh), casestr 
     
     fs = s3fs.S3FileSystem()
     paths = fs.ls(bucket)
@@ -136,25 +131,32 @@ class AWSGRAFArchive(Source):
     # Attribute used by the Anemoi class 
     # for creating a valid_time coordinates 
     lead_time = True 
+    FREQ = "15min"
+    
+    # pd.timedelta and anemoi does not like FREQ
+    # so created this constant for the anemoi.py 
+    # to use to store frequency. Unfortunate, 
+    # frequency cannot be directly determined from 
+    # the forecast datetimes :( 
+    STORED_FREQ = "15m"
+    
     BUCKET = "s3://twc-graf-reforecast/"
     
+    # Monte: Though we are using a single time dimension, 
+    # data loading and hence the sample dim is the model run init time.
     sample_dims = ("init_time",)
     horizontal_dims = ("cell",)
    # file_suffixes = ?
    # static_vars = ()
     
-    MAPPER = {
-        "15min" : "15m",
-        "5min" : "05m"
+    FREQ_RENAMER = {
+        "15m" : "15min",
+        "05m" : "05min"
              }
     
     @property
-    def available_variables(self) -> tuple:
-        return tuple(self._xds.data_vars)
-
-    @property
-    def available_levels(self) -> tuple:
-        return tuple(self._xds["level"].values)
+    def name(self) -> str:
+        return self.__class__.__name__
     
     def rename_coords(self, xds:xr.Dataset) -> xr.Dataset:
         rename = {"nCells" : "cell", 
@@ -166,10 +168,7 @@ class AWSGRAFArchive(Source):
                 
         return xds.rename(rename) 
     
-    #def __str__(self):
-    #    pass
-        
-    
+  
     def __init__(
         self, 
         # Required inputs to create the sample dim iter 
@@ -179,11 +178,10 @@ class AWSGRAFArchive(Source):
         # sampled with "lead_times" below, we only 
         # need an init_time iter. 
         init_time : dict[Literal["start", "stop"], str],
-        freq : Literal["15min", "5min"], 
         lead_times : dict[Literal["start", "stop"], str],
-        variables : Optional[list | tuple] = None, 
+        variables : Optional[dict] = None, 
         levels : Optional[list | tuple] = None, 
-        geographic_extent =dict[Literal["lat_min", "lat_max", "lon_min", "lon_max"], float],
+        geographic_extent = dict[Literal["lat_min", "lat_max", "lon_min", "lon_max"], float],
         static_file_path : str = None, 
         destagger_kwargs = None, 
         add_static_vars : bool = True,
@@ -195,10 +193,9 @@ class AWSGRAFArchive(Source):
                 Dictionary with start and stop of a time range ( 
                 e.g., "2012-01-01") to select cases in the 
                 AWS GRAF S3 bucket 
-            freq : "15min" or "5min"
-                Indicating whether to load the 15min or 5min zarr files
-            variables : list of strs
-                Variables to grab
+            variables : dict 
+                Variables to grab to grab from the 15min and 5min datasets
+                keys are "15m" and "05m"
             levels : list/tuple
                 Vertical levels to grab 
             lead_times : dict 
@@ -218,25 +215,24 @@ class AWSGRAFArchive(Source):
             temporal_aggregate_kwargs : dict (default=None)
                 If provided, used to temporally aggregated data. 
                 Primary used for aggregating the 5min data to the 15min data.
-        """
-        
+        """  
         if lead_times is None:
             lead_times = {} 
-            
-        dts = get_date_iter(
+                
+        self.init_times_df = get_date_iter(
             self.BUCKET, init_time["start"], 
             init_time["stop"])
         
+        self.init_time_dict = init_time 
+        
         # Returns the directory names in the AWS bucket
-        self.init_time = dts["case"].values
+        self.init_time = self.init_times_df["case"].values
         # Returns the initial condition timestamps 
         # associated with the directory names above.
         # The init_time timestamps were set as the index.
         # Convert to strings. 
-        self.init_time_dts = pd.to_datetime(dts.index)
-        
-        self.freq = freq 
-        
+        self.init_time_dts = pd.to_datetime(self.init_times_df.index)
+       
         self.variables = variables
         self.levels = levels 
         self.lead_times = lead_times 
@@ -246,6 +242,55 @@ class AWSGRAFArchive(Source):
         self.add_static_vars = add_static_vars
         self.temporal_aggregate_kwargs = temporal_aggregate_kwargs
         self._load_static_file(static_file_path)
+        
+        # Precompute valid_time coordinate
+        self.valid_times = self._compute_valid_times()
+    
+    def _compute_valid_times(self) -> pd.DatetimeIndex:
+        """Expand init_times × lead_times into a flat 1D valid_time index."""
+        if not {"start", "stop"} <= set(self.lead_times):
+            raise ValueError("lead_times must include 'start' and 'stop' keys")
+
+        # Parse lead_time start/stop into Timedelta
+        lt_start = pd.to_timedelta(self.lead_times["start"])
+        lt_stop = pd.to_timedelta(self.lead_times["stop"])
+        freq = pd.to_timedelta(self.FREQ)
+
+        # Number of forecast steps per init_time
+        n_steps = int(((lt_stop - lt_start) / freq) + 1)
+
+        all_valid_times = []
+        for init in self.init_times_df.index:
+            # start forecast clock from init + lt_start
+            start_time = init + lt_start
+            times = pd.date_range(start=start_time, periods=n_steps, freq=freq)
+            all_valid_times.append(times)
+
+        # Flatten into one continuous index
+        return pd.DatetimeIndex(np.concatenate(all_valid_times))
+
+    def __str__(self) -> str:
+        attrslist = ["init_time", "valid_times"] + [
+            #"init_time", this is the sample dim
+            "init_time_dict",
+            "lead_times",
+            "variables",
+            "levels",
+            "geographic_extent",
+            "static_file_path",
+            "destagger_kwargs",
+            "add_static_vars",
+            "temporal_aggregate_kwargs",
+        ] 
+        
+        title = f"Source: {self.name}"
+        msg = f"\n{title}\n" + \
+              "".join(["-" for _ in range(len(title))]) + "\n"
+
+        for key in attrslist:
+            msg += f"{key:<18s}: {getattr(self, key)}\n"
+
+        return msg
                
     def _load_static_file(self, static_file_path):
         """Load the static netcdf file with latitude and longitude cell values"""
@@ -273,24 +318,35 @@ class AWSGRAFArchive(Source):
             'land_sea_mask' : static_nc.variables['landmask'][:],
         }
         
-        self.variables += list(self.lat_lon.keys())
+        self.variables["15m"] += list(self.lat_lon.keys())
         if self.add_static_vars:
-            self.variables += list(self.static_vars.keys())
+            self.variables["15m"] += list(self.static_vars.keys())
 
                 
     def _build_path(self, init_time : str) -> str:
-        """Build the file path to a GRAF file on AWS."""
-        freq = self.MAPPER[self.freq]
-        
-        fullpath = os.path.join(self.BUCKET, init_time, f"mpasout_{freq}.zarr")
-        logger.debug(f"{self.name}._build_path: reading {fullpath}")
-        
+        """Build the file path to a 15min and 05min GRAF file on AWS."""
         fs = s3fs.S3FileSystem(anon=True)
-        permutation_file = f"{init_time}_{freq}.txt"
-        fs.download(os.path.join(self.BUCKET, "permutations", permutation_file), '.')
+                               
+        def make_entry(freq: str) -> tuple[str, str]:
+            # Dataset path
+            zarr_path = os.path.join(self.BUCKET, init_time, f"mpasout_{freq}.zarr")
+
+            # Permutation file
+            perm_file = f"{init_time}_{freq}.txt"
+            fs.download(os.path.join(self.BUCKET, "permutations", perm_file), ".")
+
+            return zarr_path, perm_file
+
+        paths = {}
+        for freq in ("15m", "05m"):
+            zarr_path, perm_file = make_entry(freq)
+            paths[freq] = {
+                "path": zarr_path,
+                "permutation_path": perm_file,
+            }
+                            
+        return paths     
         
-        return fullpath, permutation_file 
-    
     # Monte: temporary function for fixing the time ordering. 
     def parse_order_file(order_filename):
         with open(order_filename) as f:
@@ -302,33 +358,27 @@ class AWSGRAFArchive(Source):
     def open_static_vars(self, path):
         pass
         
-    def add_init_and_lead_dims(self, xds: xr.Dataset, time_resolution:str) -> xr.Dataset:
-        """Swap "time" dim for ("init_time", "lead_time") """
-
-        # Build an absolute time coordinate from attrs (same as before)
+    def add_valid_time(self, xds: xr.Dataset, time_resolution:str) -> xr.Dataset:
+        """Add a proper datetime coord for the time dimension """
+        # The start time is the valid time of the initial conditions.
+        # We can pull it from the dataset attributes. 
         start_timestamp = xds.attrs['config_start_time']
         start_time_dt = datetime.strptime(start_timestamp, '%Y-%m-%d_%H:%M:%S')
         start_time = pd.Timestamp(start_time_dt)
         num_time_points = xds.sizes["time"]
-        time_range = pd.date_range(start=start_time, periods=num_time_points, freq=time_resolution)
-
-        xds = xds.assign_coords(time=("time", time_range))
-    
-        # Convert 'time' dimension to timedeltas from the first time point
-        # So it is 'lead time' since the first time steps (e.g., 0min, +15 min, +30min, and so on)
-        init_time = np.datetime64(time_range[0], 'ns')
-        lead_time = (xds["time"] - init_time).astype("timedelta64[ns]")  
-
-        xds = xds.assign_coords(lead_time=("time", lead_time.data))
-        xds = xds.swap_dims({"time" : "lead_time"})
+        valid_times = pd.date_range(start=start_time, periods=num_time_points, freq=time_resolution)
         
-        # Add a length-1 init_time dimension/coord
-        xds = xds.expand_dims("init_time", axis=0)
-        xds = xds.assign_coords(init_time=("init_time", [np.datetime64(init_time, 'ns')]))
+        #xds = xds.assign_coords(time=("time", time_range))
         
-        xds = xds.drop_vars("time")
-        
-        return xds.transpose("init_time", "lead_time", ...)
+        # Add as a variable, not a dimension coordinate
+        xds["valid_time"] = xr.DataArray(
+            valid_times,
+            dims=("time",),
+            attrs={"description": "Forecast valid time"},
+        )
+                
+        # Ensure that time is the first dimension. 
+        return xds.transpose("time", ...)
     
     def add_level_coord(self, xds : xr.Dataset)->xr.Dataset: 
         if "level" in xds.dims:
@@ -352,85 +402,113 @@ class AWSGRAFArchive(Source):
             xds = xds.isel(level=self.levels) 
         
         return xds
-    
-    def open_sample_dataset(
-        self, 
-        dims : dict, 
-        open_static_vars: bool, 
-        cache_dir : Optional[str] = None,
-    )-> xr.Dataset:
-     
-        self.stored_freq = "15min"
-    
-        path, permutation_path = self._build_path(**dims) 
+
+    def select_by_lead_times(self,
+                             xds:xr.Dataset, 
+                             start: str,
+                             stop: str,                 
+    )->xr.Dataset:
+        """Using lead time, sub-select the forecast data"""
+        # Convert inputs to timedelta
+        start_td = pd.to_timedelta(start)
+        stop_td = pd.to_timedelta(stop)
         
-        # Open and rename coordinates 
-        xds = xr.open_zarr(
-            path, 
-            # Crucial to have {} rather than None
-            # to lazily load data as dask arrays.
-            #chunks={},
-            storage_options=dict(anon=True),
-            consolidated=True, 
-            decode_timedelta=True
-        )
-        
-        # Raise a deprecation warning about the time reordering. 
+        # Compute lead times relative to first init time
+        # (e.g., 0min, +15 min, +30min, and so on)
+        init_time = np.datetime64(xds.time.values[0], "ns")
+        lead_times = (xds["time"].values - init_time).astype("timedelta64[s]").astype("timedelta64[ns]")
+ 
+        mask = (lead_times >= start_td) & (lead_times <= stop_td)
+
+        return xds.sel(time=xds.time[mask])
+    
+    def apply_temp_time_reordering(self, xds_dict : dict, paths : dict)->dict:
+       # Raise a deprecation warning about the time reordering. 
         warnings.warn(
             "Using `parse_order_file` for time reordering is deprecated "
             "Update workflow once new data is available",
             DeprecationWarning,
             stacklevel=2  # points warning at caller, not inside this function
             )
+        for freq_key in xds_dict.keys():
+            permutation_path = paths[freq_key]["permutation_path"]
+            _, time_indices = parse_order_file(permutation_path)
+            xds_dict[freq_key] = xds_dict[freq_key].isel(Time=time_indices)
+            # Delete the permutation path
+            logger.info(f"Deleting {permutation_path}...")
+            os.remove(permutation_path)
+            
+        return xds_dict
+                               
+    def open_sample_dataset(
+        self, 
+        dims : dict, 
+        open_static_vars: bool, 
+        cache_dir : Optional[str] = None,
+    )-> xr.Dataset:
+         
+        paths = self._build_path(**dims) 
         
-        _, time_indices = parse_order_file(permutation_path)
-        xds = xds.isel(Time=time_indices)
+        # Open and rename coordinates 
+        xds_dict = {}
+        for freq_key in paths.keys():                        
+            xds_dict[freq_key] = xr.open_zarr(
+                paths[freq_key]["path"], 
+                storage_options=dict(anon=True),
+                consolidated=True, 
+                decode_timedelta=True
+            )
         
-        xds = self.rename_coords(xds)
+        xds_dict = self.apply_temp_time_reordering(xds_dict, paths)
         
-        # Add init_time, lead_time, and level dimensions. 
-        # Perform first before adding the static variables 
-        # so that aren't expanded with the new init_time dim.
-        # Though Anemoi in ufs2arco will eventually 
-        # expand the static variables. 
-        xds = self.add_init_and_lead_dims(xds, self.freq)
-        xds = self.add_level_coord(xds) 
         
         # Add the latitude and longitudes
         # and optionally add static variables. 
+        # Only add to the 15min dataset to avoid redundancy.
         for var in self.lat_lon.keys():
-            xds[var] = (['cell'], self.lat_lon[var])
+            xds_dict["15m"][var] = (['cell'], self.lat_lon[var])
+        for var in self.static_vars.keys():
+            xds_dict["15m"][var] = (['cell'], self.static_vars[var])
         
-        if self.add_static_vars:
-            for var in self.static_vars.keys():
-                xds[var] = (['cell'], self.static_vars[var])
-                
-        # Performing the sub-selecting: 
-        # variables, geographic region, levels
-        xds = xds[self.variables]
-        xds = self.select_geographic_extent(xds)
+        # Add proper time and level dimensions. 
+        # Perform first before adding the static variables 
+        # so that aren't expanded with the new init_time dim.
+        # Though Anemoi in ufs2arco will eventually 
+        # expand the static variables.
+        for freq in xds_dict.keys(): 
+            xds_dict[freq] = self.rename_coords(xds_dict[freq])
+            xds_dict[freq] = self.add_valid_time(xds_dict[freq], self.FREQ_RENAMER[freq])
+            xds_dict[freq] = self.add_level_coord(xds_dict[freq]) 
+            xds_dict[freq] = xds_dict[freq][self.variables[freq] + ["valid_time"]]
+        
+        # Perform the temporal aggregation on the 5min dataset 
+        # and concatenate with the 15min dataset 
+        if self.temporal_aggregate_kwargs is not None:
+            xds_dict["05m"] = temporal_aggregate(xds_dict["05m"], **self.temporal_aggregate_kwargs)
+   
+        for var in self.variables["05m"]:
+            xds_dict["15m"][var] = xds_dict["05m"][var]
+        
+        xds = xds_dict["15m"]
 
-        # Performing the sub-selecting: 
-        # variables, geographic region, levels
-        xds = xds[self.variables]
+        # Select the geographic region, vertical levels, 
+        # perform destaggering.
         xds = self.select_geographic_extent(xds)
-              
-        # Perform destaggering after adding the level dim.
-        # and then sub-selecting levels
         if self.destagger_kwargs is not None:
             xds = destagger(xds, **self.destagger_kwargs) 
-           
         xds = self.select_levels(xds)  
-        
-        if self.temporal_aggregate_kwargs is not None:
-            xds = temporal_aggregate(xds, **self.temporal_aggregate_kwargs)
-        
+                
         if self.lead_times is not None:
-            xds = xds.sel(
-                    lead_time=slice(pd.to_timedelta(self.lead_times["start"]), 
-                                    pd.to_timedelta(self.lead_times["stop"]))               
-        )
-           
+            xds = self.select_by_lead_times(xds, 
+                                      self.lead_times["start"],
+                                      self.lead_times["stop"],
+                                      )
+            
+        # Drop the time coordinate values.
+        # To concatenate non-unique forecast valid times,
+        # using a DataArray ("valid_time")
+        xds = xds.drop_vars("time")
+        
         return xds 
         
         

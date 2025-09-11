@@ -83,7 +83,7 @@ class Target:
         # set these for different source handling
         self._has_fhr = getattr(self.source, "fhr", None) is not None
         self._has_member = getattr(self.source, "member", None) is not None 
-        self._has_lead_time = getattr(self.source, "lead_time", None) is not None
+        ##self._has_lead_time = getattr(self.source, "lead_time", None) is not None
 
         # check chunks
         for dim in self.renamed_sample_dims:
@@ -145,7 +145,6 @@ class Target:
     def name(self) -> str:
         return self.__class__.__name__
 
-
     @property
     def renamed_sample_dims(self) -> tuple:
         return tuple(self.rename.get(d, d) for d in self.sample_dims)
@@ -193,7 +192,8 @@ class Target:
 
     def compute_forcings(self, xds: xr.Dataset) -> xr.Dataset:
 
-        time = "valid_time" if self._has_fhr or self._has_lead_time else "time"
+        # Monte: hardcoding for now
+        time = "valid_time" #if self._has_fhr or self._has_lead_time else "time"
         mappings = fmod.get_mappings(time=time)
         for key in self.forcings:
 
