@@ -8,7 +8,7 @@ from .aws_hrrr_archive import AWSHRRRArchive
 from .gcs_era5_1degree import GCSERA5OneDegree
 from .gcs_replay_atmosphere import GCSReplayAtmosphere
 from .gfs_archive import GFSArchive
-
+from .aws_graf_reforecast import AWSGRAFArchive
 
 # writing something general is actually more work than
 # just explicitly writing out the implemented data sources here
@@ -19,4 +19,5 @@ _recognized = {
     "gcs_replay_atmosphere": "GCSReplayAtmosphere",
     "gfs_archive": "GFSArchive",
     "aws_aorc": "AWSAORC",
+    "aws_graf_archive" : "AWSGRAFArchive",
 }

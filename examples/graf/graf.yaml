@@ -1,0 +1,157 @@
+mover: 
+    name: mpidatamover # mpidatamover, datamover
+    
+    # Need for datamover, but not mpidatamover
+    #batch_size : 1
+
+directories:
+    # Where to store the final zarr dataset, 
+    # caches, and log files.
+    zarr: /home/mflora/repos/ufs2arco/examples/graf/training.zarr
+    cache: /home/mflora/repos/ufs2arco/examples/graf/ufs2arco-cache/
+    logs: /home/mflora/repos/ufs2arco/examples/graf/ufs2arco-logs/training
+    
+multisource: 
+
+    # 15-min GRAF data
+    - source: 
+        name: aws_graf_archive 
+        
+        init_time : 
+            start : 2012-01-01
+            stop  : 2012-01-10
+        freq : 15min 
+        
+        variables: 
+            # 3D prognostic 
+            - w 
+            - theta 
+            # 2D prognostic 
+            - u10 
+        # Based on MPAS model levels 
+        # Computed as:
+        # N_LEVELS = 50
+        # levels = np.arange(0, N_LEVELS, 3)
+        levels: 
+            - 0
+            - 3
+            - 6
+            #- 9
+            #- 12
+            #- 15
+            #- 18
+            #- 21
+            #- 24
+            #- 27
+            #- 30
+            #- 33
+            #- 36
+            #- 39
+            #- 42
+            #- 45
+            #- 48
+        # Time range used as a slice(start, stop)
+        # Expressed at timedelta strs
+        lead_times : 
+            start : 1h
+            stop : 3h
+            
+        geographic_extent:
+            lat_min: 35.0
+            lat_max: 40.0
+            lon_min: 245.0
+            lon_max: 250.0
+        
+        # Static file with longitudes, latitudes, surface elevation, and land-sea mask 
+        static_file_path : "/home/mflora/repos/graf-ainwp/notebooks/rpm4km.static.nc"
+        
+        destagger_kwargs: 
+            vars_to_destag : 
+                w: nVertLevelsP1
+            unstag_dim_names: 
+                nVertLevelsP1 : level
+        
+        add_static_vars : True
+        
+    # 5-min GRAF data
+    - source: 
+        name: aws_graf_archive 
+        init_time : 
+            start : 2012-01-01
+            stop  : 2012-01-10
+        freq : 5min 
+        
+        variables: 
+            - apcp_bucket 
+            
+        # Time range used as a slice(start, stop)
+        # Applied after the temporal aggregation so the 
+        # indices align with the 15-min dataset. 
+        lead_times : 
+            start : "1h"
+            stop :  "3h"
+            
+        geographic_extent:
+            lat_min: 35.0
+            lat_max: 40.0
+            lon_min: 245.0
+            lon_max: 250.0
+        
+        # Static file with longitudes, latitudes, surface elevation, and land-sea mask 
+        static_file_path : "/home/mflora/repos/graf-ainwp/notebooks/rpm4km.static.nc"
+        
+        add_static_vars : False
+        
+        temporal_aggregate_kwargs:
+          var_to_stat_mapping:
+            max:
+              - prate
+              - total_cloud_cover
+            sum:
+              - apcp_bucket
+              - conv_bucket
+              - rain_bucket
+              - snow_bucket
+              - zrain_bucket
+
+          coarsen_kwargs:
+            # 15 min / 5 min = 3 
+            lead_time: 3
+            boundary: trim
+            side: right
+
+target:
+  name: anemoi
+  do_flatten_grid : False
+  sort_channels_by_levels: True
+  compute_temporal_residual_statistics: True
+  
+  # Monte: when setting these periods ensure 
+  # they overlap with actual times in the dataset
+  # otherwise, it will raise AssertionError
+  statistics_period:
+    start: 2012-01-03T12
+    end: 2012-01-09T12
+  forcings:
+    - cos_latitude
+    - sin_latitude
+    - cos_longitude
+    - sin_longitude
+    - cos_julian_day
+    - sin_julian_day
+    - cos_local_time
+    - sin_local_time
+    - insolation
+
+  chunks:
+    lead_time: 1
+    init_time : 1
+    variable: -1
+    ensemble: 1
+    cell: -1         
+
+        
+
+        
+        
+        

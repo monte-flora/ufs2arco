@@ -13,6 +13,12 @@ from ufs2arco.targets import Target
 
 logger = logging.getLogger("ufs2arco")
 
+def _snap_to_valid_time(valid_time, date: pd.Timestamp) -> pd.Timestamp:
+    """Snap a given date to the nearest valid_time in the dataset."""
+    valid_times = pd.to_datetime(valid_time.values)
+    idx = np.argmin(np.abs(valid_times - date))
+    return valid_times[idx]
+
 class Anemoi(Target):
     """
     Store dataset ready for anemoi
@@ -33,7 +39,6 @@ class Anemoi(Target):
     """
 
     # these should probably be options
-    do_flatten_grid = True
     resolution = None
     use_level_index = False
     allow_nans = True
@@ -60,20 +65,27 @@ class Anemoi(Target):
         else:
             return self.expanded_horizontal_dims
 
+    @property 
+    def trajectory_ids(self):
+        return self.source.trajectory_ids 
+        
     @property
     def datetime(self):
         if self._has_fhr:
             return self.source.t0 + pd.Timedelta(hours=self.source.fhr[0])
         else:
-            return self.source.time
-
+            return self.source.valid_times
+        
     @property
     def dates(self):
         return self.datetime
 
     @property
     def time(self):
-        return np.arange(len(self.dates))
+        # Given the non-unique forecast valid times,
+        # best not to rely on the self.datetime property
+        # It was causing issues in the datamover.find_my_region func.
+        return np.arange(self.source.n_samples)
 
     @property
     def ensemble(self):
@@ -89,13 +101,15 @@ class Anemoi(Target):
     @property
     def end_date(self):
         return str(self.datetime[-1]).replace(" ", "T")
-
+    
     @property
     def statistics_start_date(self):
         if self.statistics_period.get("start", None) is None:
             return self.start_date
         else:
             date = pd.Timestamp(self.statistics_period.get("start"))
+            date = _snap_to_valid_time(self.datetime, date)
+            
             assert date in self.datetime, "{self.name}: could not find statistics_start_date within datetime"
             return str(date).replace(" ", "T")
 
@@ -105,6 +119,7 @@ class Anemoi(Target):
             return self.end_date
         else:
             date = pd.Timestamp(self.statistics_period.get("end"))
+            date = _snap_to_valid_time(self.datetime, date)
             assert date in self.datetime, "{self.name}: could not find statistics_end_date within datetime"
             return str(date).replace(" ", "T")
 
@@ -121,6 +136,7 @@ class Anemoi(Target):
 
         if self._has_member:
             protected_rename["member"] = "ensemble"
+            
         return protected_rename
 
 
@@ -140,6 +156,7 @@ class Anemoi(Target):
         compute_temporal_residual_statistics: Optional[bool] = False,
         sort_channels_by_levels: Optional[bool] = False,
         variables_with_nans: Optional[list] = None,
+        do_flatten_grid : bool = False
     ) -> None:
 
         super().__init__(
@@ -166,6 +183,8 @@ class Anemoi(Target):
                 self.rename.pop(key)
 
         self.variables_with_nans = variables_with_nans
+        
+        self.do_flatten_grid = do_flatten_grid
 
 
     def get_expanded_dim_order(self, xds):
@@ -177,7 +196,7 @@ class Anemoi(Target):
         self,
         xds: xr.Dataset,
     ) -> xr.Dataset:
-
+        
         if self._has_fhr:
             xds["valid_time"] = xds["t0"] + xds["lead_time"].compute()
             xds = xds.squeeze("fhr", drop=True)
@@ -187,12 +206,25 @@ class Anemoi(Target):
 
         if not self._has_member:
             xds = xds.expand_dims({"ensemble": self.ensemble})
+            
+        # drop ensemble from valid_time
+        xds["valid_time"] = xds["valid_time"].squeeze("ensemble")
+        
+        # In base.py, only 2 transforms are applied
+        # (1) renaming , (2) compute forcings 
+        xds = super().apply_transforms_to_sample(xds) 
+        
+        val_time_da = xds["valid_time"]
+        lat_da = xds['latitudes']
+        lon_da = xds['longitudes']
 
-        xds = super().apply_transforms_to_sample(xds)
         xds = self._map_datetime_to_index(xds)
+        xds = xds.drop_vars(['latitudes', 'longitudes', 'valid_time'])
+        
         xds = self._map_levels_to_suffixes(xds)
         xds = self._map_static_to_expanded(xds)
-        xds = xds.transpose(* (("time", "ensemble") + tuple(xds.attrs["stack_order"])) )
+        dims = ("time", "ensemble") + tuple(xds.attrs.get("stack_order", ()))        
+        xds = xds.transpose(*dims)
         xds = self._stackit(xds)
         xds = self._calc_sample_stats(xds)
         if self.do_flatten_grid:
@@ -200,6 +232,14 @@ class Anemoi(Target):
         xds = xds.transpose(*self.dim_order)
         xds = xds.reset_coords()
         xds = xds[sorted(xds.data_vars)]
+        
+        # Add the latitude and longitude back in 
+        xds['latitudes'] = lat_da.isel(ensemble=0)
+        xds['longitudes'] = lon_da.isel(ensemble=0) 
+        
+        # Monte: hardcoding the variable dim rechunking.
+        xds = xds.chunk({"variable" : -1})
+
         return xds
 
 
@@ -211,7 +251,8 @@ class Anemoi(Target):
             "resolution": str(self.resolution),
             "start_date": self.start_date,
             "end_date": self.end_date,
-            "frequency": self.datetime.freqstr,
+            # Monte: hardcoded!
+            "frequency": self.source.STORED_FREQ, 
             "statistics_start_date": self.statistics_start_date,
             "statistics_end_date": self.statistics_end_date,
         }
@@ -263,8 +304,15 @@ class Anemoi(Target):
         Returns:
             xds (xr.Dataset): with new time dimension "time" ("dates" is still there)
         """
-
-        t = [list(self.datetime).index(date) for date in xds["dates"].values]
+        # Monte: since "time" is a dummy variable for the forecast data, 
+        # we want to use "valid_time" here. 
+        #t = [list(self.datetime).index(date) for date in xds["valid_time"]]
+        
+        # Modifying for the original ufs2arco to account for non-unique values
+        this_ic = xds.attrs['init_time']
+        _id = self.source.trajectory_id_dict[this_ic]
+        t = np.where(self.trajectory_ids==_id)[0]
+        
         xds["time"] = xr.DataArray(
             t,
             coords=xds["dates"].coords,
@@ -274,12 +322,15 @@ class Anemoi(Target):
             },
         )
         xds = xds.swap_dims({"dates": "time"})
-
+        
         # anemoi needs "dates" to be stored as a specific dtype
         # it turns out that this is hard to do consistently with xarray and zarr
         # especially with this "write container" + "fill incrementally" workflow
         # so... let's just store "dates" during aggregate_stats
-        xds = xds.drop_vars("dates")
+        
+        # Monte: raised an error
+        #xds = xds.drop_vars("dates")
+        
         return xds
 
     def _map_levels_to_suffixes(self, xds):
