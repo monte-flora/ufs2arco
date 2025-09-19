@@ -3,6 +3,7 @@ try:
 except:
     pass
 
+import traceback
 import os
 import logging
 import yaml
@@ -79,7 +80,6 @@ class Driver:
             AssertionError: If required sections or keys are missing in the configuration.
             NotImplementedError: If a source, target, or mover is not recognized.
         """
-
         with open(config_filename, "r") as f:
             self.config = yaml.safe_load(f)
 
@@ -281,7 +281,12 @@ class Driver:
 
                 xds = xds.reset_coords(drop=True)
                 region = self.mover.find_my_region(xds)
-                xds.to_zarr(self.store_path, region=region)
+                try:
+                    xds.to_zarr(self.store_path, region=region)
+                except Exception as e:
+                    print(f"\n {xds=}")
+                    traceback.print_exc()
+                    break 
                 self.mover.clear_cache(batch_idx)
 
             elif xds is not None:

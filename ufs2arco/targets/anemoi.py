@@ -65,20 +65,27 @@ class Anemoi(Target):
         else:
             return self.expanded_horizontal_dims
 
+    @property 
+    def trajectory_ids(self):
+        return self.source.trajectory_ids 
+        
     @property
     def datetime(self):
         if self._has_fhr:
             return self.source.t0 + pd.Timedelta(hours=self.source.fhr[0])
         else:
             return self.source.valid_times
-
+        
     @property
     def dates(self):
         return self.datetime
 
     @property
     def time(self):
-        return np.arange(len(self.dates))
+        # Given the non-unique forecast valid times,
+        # best not to rely on the self.datetime property
+        # It was causing issues in the datamover.find_my_region func.
+        return np.arange(self.source.n_samples)
 
     @property
     def ensemble(self):
@@ -245,7 +252,7 @@ class Anemoi(Target):
             "start_date": self.start_date,
             "end_date": self.end_date,
             # Monte: hardcoded!
-            "frequency": self.source.STORED_FREQ, #self.datetime.freqstr,
+            "frequency": self.source.STORED_FREQ, 
             "statistics_start_date": self.statistics_start_date,
             "statistics_end_date": self.statistics_end_date,
         }
@@ -299,7 +306,13 @@ class Anemoi(Target):
         """
         # Monte: since "time" is a dummy variable for the forecast data, 
         # we want to use "valid_time" here. 
-        t = [list(self.datetime).index(date) for date in xds["valid_time"]]
+        #t = [list(self.datetime).index(date) for date in xds["valid_time"]]
+        
+        # Modifying for the original ufs2arco to account for non-unique values
+        this_ic = xds.attrs['init_time']
+        _id = self.source.trajectory_id_dict[this_ic]
+        t = np.where(self.trajectory_ids==_id)[0]
+        
         xds["time"] = xr.DataArray(
             t,
             coords=xds["dates"].coords,

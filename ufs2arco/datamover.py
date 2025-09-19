@@ -240,8 +240,12 @@ class DataMover():
         region = {k: slice(None, None) for k in xds.dims}
         
         for key in self.target.renamed_sample_dims:
-            full_array = getattr(self.target, key) # e.g. all of the initial conditions
-            batch_indices = [list(full_array).index(value) for value in xds[key].values]
+            #full_array = getattr(self.target, key) # e.g. all of the initial conditions
+            # Monte: time is the only dim used to determine our "regions" for the GRAF dataset
+            # To avoid issues of non-unique times with the .index method, we just return 
+            # the xds.time.values, which are in logical form after .apply_transforms_to_sample
+            batch_indices = xds[key].values
+            #batch_indices = [list(full_array).index(value) for value in xds[key].values]
             region[key] = slice(batch_indices[0], batch_indices[-1]+1)
 
         return region
