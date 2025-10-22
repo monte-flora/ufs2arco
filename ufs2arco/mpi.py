@@ -42,7 +42,7 @@ class MPITopology:
         self.root = 0
         self.pid = os.getpid()
         self.friends = tuple(ii for ii in range(self.size) if ii!=self.root)
-
+        
         self._init_log(log_dir=log_dir, level=log_level)
         logger.info(str(self))
 
@@ -71,8 +71,12 @@ class MPITopology:
         self.logfile = f"{self.log_dir}/log.{self.rank:04d}.{self.size:04d}.out"
 
         logger.setLevel(level=level)
+        logger.handlers.clear()        # 🔑 remove any existing handlers (e.g., StreamHandler)
+        logger.propagate = False       # don’t bubble to root logger
+        
         formatter = SimpleFormatter(fmt="[%(relativeCreated)d s] [%(levelname)-7s] %(message)s")
-        handler = logging.FileHandler(self.logfile, mode="w+")
+        # use "w" instead of "w+" to avoid clobbering if multiple handlers attach 
+        handler = logging.FileHandler(self.logfile, mode="w")
         handler.setLevel(level=level)
         handler.setFormatter(formatter)
         logger.addHandler(handler)

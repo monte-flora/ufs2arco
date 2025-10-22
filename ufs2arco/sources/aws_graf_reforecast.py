@@ -9,6 +9,7 @@
 import logging 
 from typing import Optional, Literal
 import os 
+import time 
 
 import numpy as np
 import pandas as pd 
@@ -26,6 +27,8 @@ from .graf_utils import (parse_order_file,
                     subsample_by_month,
                    )
 
+from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
+
 logger = logging.getLogger("ufs2arco")
 
     
@@ -37,6 +40,29 @@ class AWSGRAFArchive(Source):
         Atmospheric data is stored with a 15-min frequency, but 
         preciptation data is stored separately with a 5-min frequency 
     """
+    
+    # Note: this list includes variables from both the 15m and 05m files. 
+    available_variables = (
+        # 15m variables
+        "bli", "cape", "ceiling_agl", "cin", "cpoice", "cporain", "cposnow",
+        "dewpoint_2m", "echotop", "fwi", "hpbl", "lcl", "lh", "lh01h", "mslp",
+        "olrtoa", "pdi", "precipw", "pressure", "q2", "qc", "qg", "qi", "qr",
+        "qs", "qv", "sh2o", "skintemp", "smois", "snow_ratio", "snowh", "swdnb",
+        "swdnb01h", "swdnbdn", "swdnbdn01h", "t2m", "temperature", "theta",
+        "tpi", "tslb", "u10", "uReconstructMeridional", "uReconstructZonal",
+        "v10", "visibility", "w", "windgust10m", 
+        
+        # 05min variables
+        "apcp_bucket", "conv_bucket",
+        "prate", "ptype", "rain_bucket", "snow_bucket", "total_cloud_cover",
+        "zrain_bucket",
+        
+        # static variables
+        'surface_elevation', 'land_sea_mask', 'climo_soiltemp', 'latitude', 'longitude'
+    )
+    
+    available_levels = list(range(50))
+    
     # pd.timedelta and anemoi does not like FREQ
     # so created this constant for the anemoi.py 
     # to use to store frequency. Unfortunate, 
@@ -49,7 +75,7 @@ class AWSGRAFArchive(Source):
     
     # When initializing this class, ensure that the variables
     # in sample_dims are class attributes (self.init_time=).
-    # uf2arco.datamover.DataMover uses to determine sample indices,
+    # uf2arco.datamover.DataMover uses those attributes to determine sample indices,
     # batch size, etc. For the GRAF dataset, though init_time 
     # is not a dim of the final dataset, data is stored by 
     # init_time. 
@@ -66,6 +92,12 @@ class AWSGRAFArchive(Source):
         'landmask' : 'land_sea_mask', 
         'soiltemp' : 'climo_soiltemp'
     } 
+    
+    
+    WIND_VAR_RENAMER = {
+      'uReconstructMeridional' : 'v',
+      'uReconstructZonal' : 'u', 
+    }
     
     @property
     def name(self) -> str:
@@ -89,6 +121,7 @@ class AWSGRAFArchive(Source):
         # Monte: Since we set the static lead times 
         # sampled with "lead_times" below, we only 
         # need an init_time iter. 
+        file_freqstr: Literal["05m", "15m"], 
         init_times : dict[Literal["start", "stop"], str],
         lead_times : dict[Literal["start", "stop"], str],
         variables : Optional[dict] = None, 
@@ -97,9 +130,9 @@ class AWSGRAFArchive(Source):
         geographic_extent = dict[Literal["lat_min", "lat_max", "lon_min", "lon_max"], float],
         static_file_path : str = None, 
         destagger_kwargs = None, 
-        temporal_aggregate_kwargs : dict = None,
+        temporal_aggregation_kwargs : dict = None,
         permutation_path_dir : str = None,
-        monthly_frac : float = 0.5 
+        subsample_by_month_kwargs : dict = {"frac": 1.0, "seed" :42}
     )-> None:
         """
         Args:
@@ -127,12 +160,13 @@ class AWSGRAFArchive(Source):
                 Path to the static variables 
             destagger_kwargs : dict (default=None)
                 If provided, used to destagger variables (horizontally or vertically) 
-            temporal_aggregate_kwargs : dict (default=None)
+            temporal_aggregation_kwargs : dict (default=None)
                 If provided, used to temporally aggregated data. 
                 Primary used for aggregating the 5min data to the 15min data.
             monthly_frac : float = 0.5
                 Randomly subsample data from a given month with this fraction.
         """  
+        self.file_freqstr = file_freqstr
         self.permutation_path_dir = permutation_path_dir                
         this_df = self.get_date_iter(
             self.BUCKET, 
@@ -140,7 +174,7 @@ class AWSGRAFArchive(Source):
             init_times["start"], 
             init_times["stop"])
         
-        self.init_times_df = subsample_by_month(this_df, frac=monthly_frac)
+        self.init_times_df = subsample_by_month(this_df, **subsample_by_month_kwargs)
 
         # Returns the directory names in the AWS bucket
         # This is where the sample_dims are set for the 
@@ -160,19 +194,36 @@ class AWSGRAFArchive(Source):
         self.geographic_extent = geographic_extent
         self.static_file_path = static_file_path 
         self.destagger_kwargs = destagger_kwargs 
-        self.temporal_aggregate_kwargs = temporal_aggregate_kwargs
+        self.temporal_aggregation_kwargs = temporal_aggregation_kwargs
         self._load_static_file(static_file_path)
         self._cache_geo_extent()
+            
+        # initial slicing based on geographic area, but 
+        # below add based on lead_time and vertical levels.
+        slices = { 
+            "isel": {"cell" : self.geo_extent_indices},
+            "sel": {},
+        }
         
+        if levels:
+            slices["isel"]["level"] = levels
+            # TODO: How to handle soil levels?!?!
+            # Hardcoding this at the moment. 
+            if "smois" in variables:
+                slices["isel"]["nSoilLevels"] = 0 
+            
+        super().__init__(variables, levels, use_nearest_levels=False, slices=slices)       
+              
         # Precompute valid_time coordinate
         self._compute_valid_times()
-            
-    def _cache_geo_extent(self):
-        """Pre-compute the geo extent mask"""
-        b = self.geographic_extent
-        lat, lon = self.lat_lon['latitude'], self.lat_lon['longitude'] 
-        mask = (lat >= b["lat_min"]) & (lat <= b["lat_max"]) & (lon >= b["lon_min"]) & (lon <= b["lon_max"])
-        self.geo_extent_indices = np.nonzero(mask)[0]
+        
+    def _cache_geo_extent(self): 
+        """Pre-compute the geo extent mask""" 
+        b = self.geographic_extent 
+        # lat/lon stored as (["cell"], data)
+        lat, lon = self.lat_lon['latitude'][-1], self.lat_lon['longitude'][-1]
+        mask = (lat >= b["lat_min"]) & (lat <= b["lat_max"]) & (lon >= b["lon_min"]) & (lon <= b["lon_max"]) 
+        self.geo_extent_indices = np.nonzero(mask)[0]    
         
     def _compute_valid_times(self) -> pd.DatetimeIndex:
         """Determine the valid times for all samples in the final dataset."""
@@ -246,19 +297,17 @@ class AWSGRAFArchive(Source):
         df = pd.DataFrame(records, columns=cols).set_index("init_time")
     
         return df.loc[start:stop] 
-
     
     def __str__(self) -> str:
-        attrslist = ["init_time", "valid_times"] + [
-            #"init_time", this is the sample dim
+        attrslist = ["init_time"] + [
             "lead_times",
             "variables",
+            "static_variables",
             "levels",
             "geographic_extent",
             "static_file_path",
             "destagger_kwargs",
-            "add_static_vars",
-            "temporal_aggregate_kwargs",
+            "temporal_aggregation_kwargs",
         ] 
         
         title = f"Source: {self.name}"
@@ -288,45 +337,29 @@ class AWSGRAFArchive(Source):
             self.lat_lon = {
                 # Keeping the cell latitude and longitude in degrees
                 # to be consistent with anemoi framework.
-                'latitude' : lat,
-                'longitude' : lon }
+                "latitude" : (["cell"], lat),
+                "longitude" : (["cell"],lon) 
+            }
         
             self.static_vars = {}
-            for v in self.static_variables:
-                name = self.STATIC_VAR_RENAMER.get(v, v)
-                self.static_vars[name] = static_ds.variables[v][:]
+            if self.static_variables:
+                for v in self.static_variables:
+                    name = self.STATIC_VAR_RENAMER.get(v, v)
+                    vals = static_ds.variables[v][:]
+                    self.static_vars[name] = (["cell"], static_ds.variables[v][:])
+                    self.variables.append(name) 
         
-            self.variables["15m"] += list(self.lat_lon)
-            self.variables["15m"] += list(self.static_vars)
-
+            # latitude/longitude added to both datasets
+            # for the geographic extent. 
+            self.variables += list(self.lat_lon)
                 
     def _build_path(self, init_time : str) -> str:
-        """Build the file path to a 15min and 05min GRAF file on AWS."""
-        # Monte: switched to anon=False on the new machine 
-        # to avoid issues with using mpirun.
-        #fs = s3fs.S3FileSystem(anon=False)
-                               
-        def make_entry(freq: str) -> tuple[str, str]:
-            # Dataset path
-            zarr_path = os.path.join(self.BUCKET, init_time, f"mpasout_{freq}.zarr")
-            perm_file = os.path.join(self.permutation_path_dir, f"{init_time}_{freq}.txt")
-
-            return zarr_path, perm_file
-
-        paths = {}
-        for freq in ("15m", "05m"):
-            zarr_path, perm_file = make_entry(freq)
-            paths[freq] = {
-                "path": zarr_path,
-                "permutation_path": perm_file,
-            }
-                            
-        return paths     
+        """Build the file path to a 15m or 05m GRAF file in AWS S3 bucket."""        
+        zarr_path = os.path.join(self.BUCKET, init_time, f"mpasout_{self.file_freqstr}.zarr")
+        perm_file = os.path.join(self.permutation_path_dir, f"{init_time}_{self.file_freqstr}.txt")
         
-    
-    def open_static_vars(self, path):
-        pass
-        
+        return zarr_path, perm_file 
+
     def add_valid_time(self, 
                        xds: xr.Dataset,
                        freq : str, 
@@ -355,8 +388,12 @@ class AWSGRAFArchive(Source):
         n_expected_time_steps = int(fhrs_in_mins / freq_int) + 1
         expected_times = get_expected_times(xds, f"{freq_int}min", n_expected_time_steps)
         
+        # times is the expected times while time indices
+        # are the permuted order as the data is stored. 
         times, time_indices = parse_order_file(permutation_file_path)
         
+        # Note: the time reordering is an expensive operation!
+        # Add missing times for the 5-min dataset is costly. 
         xds = xds.isel(time=time_indices)
         xds = xds.assign_coords(time=times)
         xds = add_missing_times_with_nans(xds, expected_times)
@@ -367,79 +404,46 @@ class AWSGRAFArchive(Source):
             dims=("time",),
             attrs={"description": "Forecast valid time"},
         )
-                
-        missing_times = times_with_nans(times, expected_times) 
-        logger.info(f"add_valid_times : {missing_times=}")
+        
+        start_td = pd.to_timedelta(self.lead_times["start"])
+        stop_td = pd.to_timedelta(self.lead_times["stop"])
+        
+        # Compute lead times relative to first init time
+        # (e.g., 0min, +15 min, +30min, and so on)
+        # For simplicity, replacing the actual times 
+        # with lead times for the selection process. 
+        
+        # Perform the slicing explicitly here rather 
+        # apply_slices so its applied first. 
+        init_time = xds.time.isel(time=0)
+        lead_times = (xds["time"] - init_time).astype("timedelta64[s]")    
+        xds = xds.assign_coords(time=lead_times)             
+        xds = xds.sel(time = slice(start_td, stop_td))
+        
+        # Note: uncomment to log the missing data. 
+        #missing_times = times_with_nans(times, expected_times)
+        #if len(missing_times) > 0:
+        #    logger.info(f"add_valid_times : {missing_times=}")
             
         return xds 
-        
+    
     def add_level_coord(self, xds : xr.Dataset)->xr.Dataset: 
         if "level" in xds.dims:
             level_values = np.arange(xds.sizes["level"])
             xds = xds.assign_coords(level=("level", level_values))
         return xds
     
-    def select_geographic_extent(self, xds:xr.Dataset)->xr.Dataset:
-        """Select geographic region based on a bounding box"""
-        return xds.isel(cell=self.geo_extent_indices)
+    def rename_wind_vars(self, xds : xr.Dataset)->xr.Dataset:
+        valid_map = {
+            k: v for k, v in self.WIND_VAR_RENAMER.items() if k in xds.data_vars
+        }
+        if not valid_map:  # empty dict -> nothing to rename
+            return xds
+
+        return xds.rename(valid_map)
     
-    def select_levels(self, xds:xr.Dataset)->xr.Dataset:
-        if "level" in xds.dims:
-            xds = xds.isel(level=self.levels) 
-        
-        if "nSoilLevels" in xds.dims:
-            xds = xds.isel(nSoilLevels=0)
-        
-        return xds
-
-    def select_by_lead_times(self,
-                             xds:xr.Dataset, 
-                             start: str,
-                             stop: str,                 
-    )->xr.Dataset:
-        """Using lead time, sub-select the forecast data"""
-        # Convert inputs to timedelta
-        start_td = pd.to_timedelta(start)
-        stop_td = pd.to_timedelta(stop)
-        
-        # Compute lead times relative to first init time
-        # (e.g., 0min, +15 min, +30min, and so on)
-        #init_time = np.datetime64(xds.time[0], "ns")
-        init_time = xds.time.isel(time=0)
-        lead_times = (xds["time"] - init_time).astype("timedelta64[s]")
- 
-        mask = (lead_times >= start_td) & (lead_times <= stop_td)
-
-        return xds.sel(time=xds.time[mask])
-
-    def temporal_aggregate(self, 
-                           xds: xr.Dataset, 
-                           var_to_stat_mapping : dict, 
-                           resample_kwargs : dict = {"time" :"15min"},
-    ) -> xr.Dataset:
-        data_vars = list(xds.data_vars) 
-        #xds = xds.assign_coords(time=xds.valid_time)
-    
-        outs = []
-        for stat, vars_ in var_to_stat_mapping.items():
-            if not vars_:
-                continue
-            
-            vs = [v for v in vars_ if v in data_vars]   
-            if len(vs) == 0:
-                continue                
-            sub = xds[vs]
-            
-            if stat == "sum":
-                outs.append(sub.resample(**resample_kwargs).sum(keep_attrs=True))
-            elif stat == "max":
-                outs.append(sub.resample(**resample_kwargs).max(keep_attrs=True))
-            elif stat == "mean":
-                outs.append(sub.resample(**resample_kwargs).mean(keep_attrs=True))
- 
-        xds_out = xr.merge(outs).transpose("time",...) 
-
-        return xds_out
+    def open_static_vars(self, path):
+        pass
     
     def open_sample_dataset(
         self, 
@@ -448,65 +452,62 @@ class AWSGRAFArchive(Source):
         cache_dir : Optional[str] = None,
     )-> xr.Dataset:
         
-        paths = self._build_path(**dims) 
+        zarr_path, permutation_file_path = self._build_path(**dims) 
         
-        # Open and rename coordinates 
-        xds_dict = {}
-        for freq_key in paths:                        
-            xds_dict[freq_key] = xr.open_zarr(
-                paths[freq_key]["path"], 
+        # Note: the AWS files are chunked with Time : 1 
+        xds = xr.open_zarr(
+                zarr_path, 
                 storage_options=dict(anon=True),
                 consolidated=True, 
             )
-       
+
+        xds = self.rename_coords(xds)
+        
+        # TODO: Is this the optimal way to add the static variables? 
         # Add the latitude and longitudes
         # and optionally add static variables. 
-        # Only add to the 15min dataset to avoid redundancy.
-        for var, values in self.lat_lon.items():
-            xds_dict["15m"][var] = (['cell'], values)
-        for var, values in self.static_vars.items():
-            xds_dict["15m"][var] = (['cell'], values)
-        
-        # Add proper time and level dimensions. 
-        # Perform first before adding the static variables 
-        # so that aren't expanded with the new init_time dim.
-        # Though Anemoi in ufs2arco will eventually 
-        # expand the static variables.
-        for freq in xds_dict: 
-            xds_dict[freq] = self.rename_coords(xds_dict[freq])
-            xds_dict[freq] = self.add_valid_time(xds_dict[freq], 
-                                                 self.FREQ_RENAMER[freq], 
-                                                 dims['init_time'],
-                                                 paths[freq]["permutation_path"]
-                                                 )
-            xds_dict[freq] = self.add_level_coord(xds_dict[freq]) 
-            xds_dict[freq] = xds_dict[freq][self.variables[freq] + ["valid_time"]]
-        
-        # Perform the temporal aggregation on the 5min dataset 
-        # and concatenate with the 15min dataset 
-        if self.temporal_aggregate_kwargs is not None:
-            xds_dict["05m"] = self.temporal_aggregate(xds_dict["05m"], **self.temporal_aggregate_kwargs)
-   
-        xds = xr.merge([xds_dict["15m"], xds_dict["05m"]])
+        for v in self.lat_lon:
+            xds[v] = self.lat_lon[v]
+        for v in self.static_vars:
+            xds[v] = self.static_vars[v]
 
-        # Select the geographic region, vertical levels, 
-        # perform destaggering.
-        xds = self.select_geographic_extent(xds)
-        if self.destagger_kwargs is not None:
-            xds = destagger(xds, **self.destagger_kwargs) 
-        xds = self.select_levels(xds)  
-                
-        if self.lead_times is not None:
-            xds = self.select_by_lead_times(xds, 
-                                      self.lead_times["start"],
-                                      self.lead_times["stop"],
-                                      )
+        xds = xds[self.variables]
+        xds = self.rename_wind_vars(xds)
+        xds = self.add_level_coord(xds) 
+        
+        xds = self.add_valid_time(xds, 
+                                  self.FREQ_RENAMER[self.file_freqstr], 
+                                  dims['init_time'],
+                                  permutation_file_path
+        )
             
+        if self.destagger_kwargs is not None:
+            ###logger.info(f"Performing destaggering")
+            xds = destagger(xds, **self.destagger_kwargs) 
+        
+        xds = self.apply_slices(xds)
+        
+        if self.temporal_aggregation_kwargs:
+            lat_lon_ds = xds[["latitude", "longitude"]] 
+            xds = temporal_aggregation(xds, **self.temporal_aggregation_kwargs)
+            # Add as a variable, not a dimension coordinate
+            init_time = pd.to_datetime(dims["init_time"].split("_")[0], format="%Y%m%d%H")
+            expected_times = init_time + xds.time
+            
+            xds["valid_time"] = xr.DataArray(
+                expected_times,
+                dims=("time",),
+                attrs={"description": "Forecast valid time"},
+            )
+            
+            xds["latitude"] = lat_lon_ds["latitude"]
+            xds["longitude"] = lat_lon_ds["longitude"]
+        
         # Drop the time coordinate values.
         # To concatenate non-unique forecast valid times,
-        # using a DataArray ("valid_time")
-        xds = xds.drop_vars("time")
-        
+        # using a DataArray ("valid_time"). 
+        xds = xds.drop_vars(["time"])
+               
         # Adding this attribute to find unique trajectory id 
         # for the logical time indexing. 
         xds.attrs['init_time'] = dims['init_time'] 

@@ -14,8 +14,14 @@ from ufs2arco.targets import Target
 logger = logging.getLogger("ufs2arco")
 
 def _snap_to_valid_time(valid_time, date: pd.Timestamp) -> pd.Timestamp:
-    """Snap a given date to the nearest valid_time in the dataset."""
     valid_times = pd.to_datetime(valid_time.values)
+
+    if date < valid_times.min() or date > valid_times.max():
+        raise ValueError(
+            f"Requested date {date} is outside the valid time range: "
+            f"{valid_times.min()} to {valid_times.max()}"
+        )
+
     idx = np.argmin(np.abs(valid_times - date))
     return valid_times[idx]
 
@@ -566,18 +572,37 @@ class Anemoi(Target):
         if topo.is_root:
             self.add_dates()
             self.reconcile_missing_and_nans()
+            self.add_trajectory_ids()
+            
         topo.barrier()
 
         logger.info(f"Aggregating statistics")
         self.aggregate_stats(topo)
         logger.info(f"Done aggregating statistics\n")
-
+                
         if self.compute_temporal_residual_statistics:
             logger.info(f"Computing temporal residual statistics")
             self.calc_temporal_residual_stats(topo)
             logger.info(f"Done computing temporal residual statistics\n")
-
-
+    
+    def add_trajectory_ids(self)->None:
+        """
+        Add the unique trajectory ids for each model init
+        """
+        xds = xr.open_zarr(self.store_path)
+        attrs = xds.attrs.copy()
+        
+        nds = xr.Dataset()
+        nds["trajectory_ids"] = xr.DataArray(
+            self.trajectory_ids, 
+            coords=xds["time"].coords,
+        ) 
+        
+        nds.attrs = attrs 
+        nds.to_zarr(self.store_path, mode="a")
+        logger.info(f"{self.name}.add_trajectory_ids: tracjectory ids appended to the dataset\n")
+        
+        
     def add_dates(self) -> None:
         """Deal with the dates issue
 
@@ -592,7 +617,7 @@ class Anemoi(Target):
 
         nds = xr.Dataset()
         nds["dates"] = xr.DataArray(
-            self.datetime,
+            self.datetime.astype("datetime64[s]"),
             coords=xds["time"].coords,
         )
         nds["dates"].encoding = {
@@ -732,7 +757,6 @@ class Anemoi(Target):
             local_squares = squares.copy()
             local_sums = sums.copy()
 
-
         # reduce results
         logger.info(f"{self.name}.aggregate_stats: Communicating results to root")
         topo.sum(local_count, count)
@@ -772,54 +796,66 @@ class Anemoi(Target):
 
         xds = xr.open_zarr(self.store_path)
         attrs = xds.attrs.copy()
-        freqstr = self.dates.freqstr
-
+        # Monte: Made this change for my forecast dataset, 
+        # which doesn't have a consistent freqstr
+        freqstr = xds.attrs['frequency']
+        # freqstr = self.dates.freqstr
+    
         # get the start/end times for computing statistics
         # in terms of logical time index values
         start_idx = list(self.datetime).index(pd.Timestamp(self.statistics_start_date))
         end_idx = list(self.datetime).index(pd.Timestamp(self.statistics_end_date))
         xds = xds.sel(time=slice(start_idx, end_idx))
+        
+        # Group the data by the trajectory_ids to avoid cross-forecast leakage. 
+        # At the boundaries where the trajectory changes, diffs are masked out. 
+        diffs = xds["data"].diff("time")
+        same_traj = xds["trajectory_ids"] == xds["trajectory_ids"].shift(time=1)
+        diffs = diffs.where(same_traj)
+        n_time = len(diffs["time"])
 
-        data_diff = xds["data"].diff("time")
-        n_time = len(data_diff["time"])
-        count = xds["count"].load()/len(xds["time"])*n_time
-        count = count.values.astype(np.float64)
-        time_indices = np.array_split(np.arange(n_time), topo.size)
+        # Split time indices across ranks
+        time_indices = np.array_split(np.arange(n_time - 1), topo.size)
         local_indices = time_indices[topo.rank]
 
+        # Allocate global accumulators
         residual_avg = np.zeros_like(xds["variable"].values, dtype=np.float64)
         residual_var = np.zeros_like(xds["variable"].values, dtype=np.float64)
         residual_max = np.zeros_like(xds["variable"].values, dtype=np.float64)
         residual_min = np.zeros_like(xds["variable"].values, dtype=np.float64)
+        count = np.zeros_like(xds["variable"].values, dtype=np.float64)
 
         logger.info(f"{self.name}.calc_temporal_residual_stats: Performing local computations")
         if local_indices.size > 0:
             dims = [d for d in xds["data"].dims if d != "variable"]
-            local_data_diff = data_diff.isel(time=local_indices).astype(np.float64)
-            local_residual_avg = local_data_diff.sum(dims).compute().values
-            local_residual_var = (local_data_diff**2).sum(dims).compute().values
-            local_residual_max = local_data_diff.max(dims).compute().values
-            local_residual_min = local_data_diff.min(dims).compute().values
+            local_data_diff = diffs.isel(time=local_indices).astype(np.float64)
 
+            local_count = (~np.isnan(local_data_diff)).sum(dims).compute().values.astype(np.float64)
+            local_residual_avg = local_data_diff.sum(dims, skipna=True).compute().values
+            local_residual_var = (local_data_diff**2).sum(dims, skipna=True).compute().values
+            local_residual_max = local_data_diff.max(dims, skipna=True).compute().values
+            local_residual_min = local_data_diff.min(dims, skipna=True).compute().values
         else:
+            # Return all zeros. 
+            local_count = count.copy()
             local_residual_var = residual_var.copy()
             local_residual_avg = residual_avg.copy()
             local_residual_max = residual_max.copy()
             local_residual_min = residual_min.copy()
 
         logger.info(f"{self.name}.calc_temporal_residual_stats: Communicating results to root")
+        topo.sum(local_count, count)
         topo.sum(local_residual_avg, residual_avg)
         topo.sum(local_residual_var, residual_var)
         topo.max(local_residual_max, residual_max)
         topo.min(local_residual_min, residual_min)
         logger.info(f"{self.name}.calc_temporal_residual_stats: ... done communicating")
 
-
         if topo.is_root:
             nds = xr.Dataset()
             nds.attrs = attrs
 
-            # some corrections
+            # Normalize by count
             residual_avg /= count
             residual_var = residual_var / count - residual_avg**2
 
@@ -834,6 +870,7 @@ class Anemoi(Target):
 
         # unclear if this barrier is necessary
         topo.barrier()
+
 
 
     def handle_missing_data(self, missing_data: list[dict]) -> None:

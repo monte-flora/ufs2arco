@@ -12,6 +12,8 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import zarr
+from dask.diagnostics import ProgressBar
+
 
 from ufs2arco.log import setup_simple_log
 from ufs2arco.mpi import MPITopology, SerialTopology
@@ -185,7 +187,7 @@ class MultiDriver(Driver):
         self.topo.barrier()
 
 
-    def run(self, overwrite: bool = False):
+    def run(self, overwrite: bool = False, validate: bool = False):
         """Runs the data movement process, managing the datasets and mover.
 
         This method sets up the datasets, creates the container, and loops through
@@ -194,6 +196,8 @@ class MultiDriver(Driver):
         Args:
             overwrite (bool, optional): Whether to overwrite the existing container.
                 Defaults to False.
+            validate (bool, optional): If true, validate the configs, but 
+                without saving data. Defaults to False
         """
         self.setup(runtype="create")
 
@@ -230,7 +234,10 @@ class MultiDriver(Driver):
             if all(foundit) and len(foundit) == len(self.movers):
                 mds = self.target.merge_multisource(dslist)
                 region = self.mover.find_my_region(mds)
-                mds.to_zarr(self.target.store_path, region=region)
+                if not validate:
+                    # Use ProgressBar for the zarr write operation
+                    with ProgressBar():
+                        mds.to_zarr(self.target.store_path, region=region)
 
             self.mover.clear_cache(batch_idx)
 
@@ -239,9 +246,10 @@ class MultiDriver(Driver):
         self.topo.barrier()
         logger.info(f"Done moving the data\n")
 
-        self.report_missing_data(missing_dims)
-        self.target.finalize(self.topo)
-        self.finalize_attributes()
+        if not validate:
+            self.report_missing_data(missing_dims)
+            self.target.finalize(self.topo)
+            self.finalize_attributes()
 
     def patch(self):
         raise NotImplementedError

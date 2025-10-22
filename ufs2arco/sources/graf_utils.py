@@ -25,8 +25,19 @@ def get_expected_times(xds: xr.Dataset, time_resolution: str, n_steps: int) -> p
     start_time = pd.to_datetime(start_timestamp, format='%Y-%m-%d_%H:%M:%S')
     return pd.date_range(start=start_time, periods=n_steps, freq=time_resolution)
 
-def add_missing_times_with_nans(xds: xr.Dataset, expected_times: pd.DatetimeIndex) -> xr.Dataset:
-    # Reindex to expected times, inserting NaNs for missing slots
+def add_missing_times_with_nans(
+    xds: xr.Dataset, expected_times: pd.DatetimeIndex
+    ) -> xr.Dataset:
+    """
+    Reindex dataset to expected times, inserting NaNs for missing slots.
+    If the existing times already match, skip reindexing.
+    """
+    actual_times = xds.indexes["time"]
+
+    if actual_times.equals(expected_times):
+        #print("No time reindexing need!")
+        return xds
+
     return xds.reindex(time=expected_times)
 
 def times_with_nans(actual_times: pd.DatetimeIndex, expected_times: pd.DatetimeIndex)->pd.DatetimeIndex:
@@ -60,22 +71,58 @@ def spherical_to_lat_lon(
     return lat, lon
 
 
-def subsample_by_month(df: pd.DataFrame, frac: float = 0.5, seed: int = 42) -> pd.DataFrame:
-    """Randomly keep a fraction of samples per month.
+def subsample_by_month(
+    df: pd.DataFrame, 
+    frac: float = 0.5, 
+    seed: int = 42,
+    months: list = None
+) -> pd.DataFrame:
+    """Randomly keep a fraction of samples per month, optionally filtering to specific months.
     
-    If frac=1, return the original DataFrame unchanged.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with DatetimeIndex
+    frac : float
+        Fraction of samples to keep per month (0 to 1). If 1.0, returns original.
+    seed : int
+        Random seed for reproducibility
+    months : list, optional
+        List of month numbers to keep (1-12). If None, keeps all months.
+        Example: [4, 5, 6, 7] for April-July
+    
+    Returns
+    -------
+    pd.DataFrame
+        Subsampled dataframe
+        
+    Examples
+    --------
+    >>> # Keep only April-July data
+    >>> df_sub = subsample_by_month(df, frac=1.0, months=[4, 5, 6, 7])
+    
+    >>> # Keep 50% of April-July data
+    >>> df_sub = subsample_by_month(df, frac=0.5, months=[4, 5, 6, 7])
     """
-    if frac >= 1.0:
-        return df
-    
     df = df.copy()
     df["month"] = df.index.month
-
+    
+    # Filter by months if specified
+    if months is not None:
+        df = df[df["month"].isin(months)]
+        if df.empty:
+            raise ValueError(f"No data found for months {months}")
+    
+    # If frac=1 and no further subsampling needed, return early
+    if frac >= 1.0:
+        return df.drop(columns=["month"])
+    
+    # Subsample within each month
     groups = df.groupby("month", group_keys=False)
     df_sub = pd.concat(
         [g.sample(frac=frac, random_state=seed) for _, g in groups],
         axis=0
     ).sort_index()
     
-    return df_sub 
+    return df_sub.drop(columns=["month"])
     

@@ -6,6 +6,7 @@ from ufs2arco.transforms.horizontal_regrid import horizontal_regrid
 from ufs2arco.transforms.mappings import get_available_mappings, apply_mappings
 from ufs2arco.transforms.rotate_vectors import rotate_vectors
 from ufs2arco.transforms.vertical_regrid import fv_vertical_regrid
+from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
 
 logger = logging.getLogger("ufs2arco")
 
@@ -20,6 +21,7 @@ class Transformer:
             "horizontal_regrid",
             "mappings",
             "rotate_vectors",
+            "temporal_aggregation",
         )
 
     def __init__(self, options):
@@ -93,6 +95,9 @@ class Transformer:
 
         if "mappings" in self.names:
             xds = apply_mappings(xds, self.options["mappings"])
+            
+        if "temporal_aggregation" in self.names:
+            xds = temporal_aggregate(xds, **self.options["temporal_aggregation"])
 
         return xds
 
