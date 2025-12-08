@@ -743,10 +743,10 @@ class Anemoi(Target):
             lds = xds.isel(time=local_indices)
             local_count = lds["count_array"].sum(dims).compute().values
             local_has_nans = lds["has_nans_array"].any(dims).compute().values
-            local_maximum = lds["maximum_array"].max(dims).compute().values
-            local_minimum = lds["minimum_array"].min(dims).compute().values
-            local_squares = lds["squares_array"].sum(dims).compute().values
-            local_sums = lds["sums_array"].sum(dims).compute().values
+            local_maximum = lds["maximum_array"].max(dims, skipna=True).compute().values
+            local_minimum = lds["minimum_array"].min(dims, skipna=True).compute().values
+            local_squares = lds["squares_array"].sum(dims, skipna=True).compute().values
+            local_sums = lds["sums_array"].sum(dims, skipna=True).compute().values
 
         else:
 

@@ -10,12 +10,14 @@ import logging
 from typing import Optional, Literal
 import os 
 import time 
+from copy import copy 
 
 import numpy as np
 import pandas as pd 
 import xarray as xr
 import netCDF4
 import s3fs
+import gc
 
 from ufs2arco.sources import Source 
 from ufs2arco.transforms.destagger import destagger 
@@ -25,6 +27,8 @@ from .graf_utils import (parse_order_file,
                     times_with_nans, 
                     spherical_to_lat_lon,
                     subsample_by_month,
+                    compute_composite_reflectivity,
+                    compute_geopotential_height
                    )
 
 from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
@@ -50,7 +54,8 @@ class AWSGRAFArchive(Source):
         "qs", "qv", "sh2o", "skintemp", "smois", "snow_ratio", "snowh", "swdnb",
         "swdnb01h", "swdnbdn", "swdnbdn01h", "t2m", "temperature", "theta",
         "tpi", "tslb", "u10", "uReconstructMeridional", "uReconstructZonal",
-        "v10", "visibility", "w", "windgust10m", 
+        "v10", "visibility", "w", "windgust10m", "composite_reflectivity",
+        "geopotential_height",
         
         # 05min variables
         "apcp_bucket", "conv_bucket",
@@ -216,7 +221,11 @@ class AWSGRAFArchive(Source):
               
         # Precompute valid_time coordinate
         self._compute_valid_times()
-        
+    
+    def __len__(self):
+        """Return the number of valid times"""
+        return len(self.valid_times)
+    
     def _cache_geo_extent(self): 
         """Pre-compute the geo extent mask""" 
         b = self.geographic_extent 
@@ -430,7 +439,9 @@ class AWSGRAFArchive(Source):
     def add_level_coord(self, xds : xr.Dataset)->xr.Dataset: 
         if "level" in xds.dims:
             level_values = np.arange(xds.sizes["level"])
-            xds = xds.assign_coords(level=("level", level_values))
+            #xds = xds.assign_coords(level=("level", level_values))
+            xds.coords["level"] = level_values 
+            
         return xds
     
     def rename_wind_vars(self, xds : xr.Dataset)->xr.Dataset:
@@ -442,6 +453,22 @@ class AWSGRAFArchive(Source):
 
         return xds.rename(valid_map)
     
+    def add_diagnostic_variables(self, xds, variables_to_add, vertical_dim='level'):
+        """
+        Add multiple diagnostic variables efficiently.
+        Reuses loaded variables across computations.
+        """
+        if 'composite_reflectivity' in variables_to_add and 'composite_reflectivity' not in xds.data_vars:
+            # ['pressure', 'temperature', 'qs', 'qr', 'qg', 'qv']
+            xds = compute_composite_reflectivity(xds, vertical_dim=vertical_dim)
+    
+        if 'geopotential_height' in variables_to_add and 'geopotential_height' not in xds.data_vars:
+            #['pressure', 'temperature', 'qv', 'surface_elevation']
+            xds = compute_geopotential_height(xds)
+    
+        return xds
+
+        
     def open_static_vars(self, path):
         pass
     
@@ -470,9 +497,19 @@ class AWSGRAFArchive(Source):
             xds[v] = self.lat_lon[v]
         for v in self.static_vars:
             xds[v] = self.static_vars[v]
-
-        xds = xds[self.variables]
-        xds = self.rename_wind_vars(xds)
+ 
+        # Note: for composite reflectivity, geopotential_heights
+        # added pressure, temperature, qs, qr, and qg
+        # but remove them after the computation below.          
+        diag_vars = ['composite_reflectivity', 'geopotential_height']
+        temp_var_list = [v for v in self.variables if v not in diag_vars]
+        
+        if 'composite_reflectivity' in self.variables:
+            # 15-min dataset
+            xds = xds[temp_var_list + ['pressure', 'temperature', 'qv', 'qs', 'qr', 'qg']]
+        else:
+            xds = xds[self.variables] 
+            
         xds = self.add_level_coord(xds) 
         
         xds = self.add_valid_time(xds, 
@@ -486,6 +523,15 @@ class AWSGRAFArchive(Source):
             xds = destagger(xds, **self.destagger_kwargs) 
         
         xds = self.apply_slices(xds)
+        # To save memory only compute diagnostics after the slicing
+        if 'composite_reflectivity' in self.variables:
+            xds = self.add_diagnostic_variables(xds, self.variables)
+        
+            # Keep only the variables of interest 
+            # after computing the diagnostic variables. 
+            xds = xds[self.variables+['valid_time']] 
+            
+        xds = self.rename_wind_vars(xds)
         
         if self.temporal_aggregation_kwargs:
             lat_lon_ds = xds[["latitude", "longitude"]] 
