@@ -18,13 +18,20 @@ def main():
         action="store_true",
         help="Pass this flag to overwrite an existing zarr store in the specified location",
     )
+    
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate configs without saving data"
+    )
+    
     args = parser.parse_args()
 
     with open(args.yaml_file, "r") as f:
         config = yaml.safe_load(f)
 
     if "multisource" in config.keys():
-        MultiDriver(args.yaml_file).run(overwrite=args.overwrite)
+        MultiDriver(args.yaml_file).run(overwrite=args.overwrite, validate=args.validate)
     else:
         Driver(args.yaml_file).run(overwrite=args.overwrite)
 

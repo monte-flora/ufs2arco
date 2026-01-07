@@ -67,7 +67,7 @@ class Driver:
         "attrs",
     )
 
-    def __init__(self, config_filename: str):
+    def __init__(self, config_filename: str, driver_id : int = 0):
         """Initializes the Driver object with configuration from the specified YAML file.
 
         Note:
@@ -82,7 +82,14 @@ class Driver:
         """
         with open(config_filename, "r") as f:
             self.config = yaml.safe_load(f)
-
+        
+        # Monte: with a multisource .yaml, it was convenient to 
+        # set common items between datasets. But I need to 
+        # remove those after loading the yaml. 
+        self.config = {
+            k: v for k, v in self.config.items() if k in self.recognized_sections
+        }    
+ 
         for key in self.required_sections:
             assert key in self.config, \
                 f"Driver.__init__: could not find '{key}' section in yaml"
@@ -117,7 +124,7 @@ class Driver:
         mover_kwargs = self.mover_kwargs.copy()
 
         log_dir = os.path.expandvars(self.config["directories"]["logs"])
-
+        
         if runtype != "create":
             if log_dir.endswith("/"):
                 log_dir = log_dir[:-1]
@@ -261,6 +268,7 @@ class Driver:
             overwrite (bool, optional): Whether to overwrite the existing container.
                 Defaults to False.
         """
+        
         self.setup(runtype="create")
 
         # create container, only if mover start is not 0
@@ -302,6 +310,7 @@ class Driver:
         logger.info(f"Done moving the data\n")
 
         self.report_missing_data(missing_dims)
+        
         self.target.finalize(self.topo)
         self.finalize_attributes()
 
@@ -309,7 +318,7 @@ class Driver:
 
         self.setup(runtype="patch")
         missing_dims = _open_patch_yaml(self.get_missing_data_path(self.store_path))
-
+        
         logger.info(f"Starting patch workflow with missing_dims\n{missing_dims}\n")
 
         # hacky for now, reset the mover's sample_indices to be the missing dims

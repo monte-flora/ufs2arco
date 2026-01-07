@@ -2,6 +2,7 @@ import os
 import shutil
 import itertools
 import logging
+import traceback
 
 from math import ceil
 
@@ -111,10 +112,11 @@ class DataMover():
 
                 for these_dims in batch_indices:
                     fds = self.source.open_sample_dataset(
-                        dims=these_dims,
-                        open_static_vars=self.target.always_open_static_vars,
-                        cache_dir=cache_dir,
-                    )
+                            dims=these_dims,
+                            open_static_vars=self.target.always_open_static_vars,
+                            cache_dir=cache_dir,
+                        )
+
                     if len(fds) > 0:
                         fds = self.transformer(fds)
                         fds = self.target.apply_transforms_to_sample(fds)
@@ -180,10 +182,10 @@ class DataMover():
 
         # perform any transformations like regridding
         xds = self.transformer(xds)
-
+        
         # transform it to target space
         xds = self.target.apply_transforms_to_sample(xds)
-
+        
         # create container
         # start with the dimensions we haven't read yet (sample_dims)
         nds = xr.Dataset(attrs=xds.attrs.copy())

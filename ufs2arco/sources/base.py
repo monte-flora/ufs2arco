@@ -128,26 +128,26 @@ class Source:
         """
         return xds
 
-
     def apply_slices(self, xds: xr.Dataset) -> xr.Dataset:
-        """Apply any slices, for now just data selection via "sel" or "isel"
-        Note that this is the first transformation, so slicing options relate to
-        the standard dimensions:
-
-            (t0, fhr, member, level, latitude, longitude)
-
-        Args:
-            xds (xr.Dataset): The sample dataset
-
-        Returns:
-            xr.Dataset: The dataset after slices applied
-        """
-
-        if "sel" in self.slices.keys():
-            for key, val in self.slices["sel"].items():
-                xds = xds.sel({key: slice(*val)})
-
-        if "isel" in self.slices.keys():
+        if "isel" in self.slices:
             for key, val in self.slices["isel"].items():
-                xds = xds.isel({key: slice(*val)})
+                if isinstance(val, (list, np.ndarray)):
+                    # list of indices
+                    xds = xds.isel({key: val})
+                elif isinstance(val, tuple):
+                    # interpret as slice args
+                    xds = xds.isel({key: slice(*val)})
+                else:
+                    # single integer
+                    xds = xds.isel({key: val})
+
+        if "sel" in self.slices:
+            for key, val in self.slices["sel"].items():
+                if isinstance(val, tuple) and len(val) == 2:
+                    # range selection
+                    xds = xds.sel({key: slice(*val)})
+                else:
+                    # direct value selection
+                    xds = xds.sel({key: val})
+
         return xds
