@@ -3,6 +3,15 @@ try:
 except:
     pass
 
+import dask
+# Monte: 
+# Set before loading data - increase the default chunk size
+# Crucial for data loading +1M GRAF grid points. 
+#dask.config.set({
+#    'array.chunk-size': '4GiB', 
+#    'array.slicing.split_large_chunks': False  # Prevent auto-splitting
+#                })  
+
 import os
 import logging
 import yaml
@@ -236,8 +245,7 @@ class MultiDriver(Driver):
                 region = self.mover.find_my_region(mds)
                 if not validate:
                     # Use ProgressBar for the zarr write operation
-                    with ProgressBar():
-                        mds.to_zarr(self.target.store_path, region=region)
+                    mds.to_zarr(self.target.store_path, region=region)
 
             self.mover.clear_cache(batch_idx)
 

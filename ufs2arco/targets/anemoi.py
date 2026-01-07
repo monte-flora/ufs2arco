@@ -312,12 +312,7 @@ class Anemoi(Target):
         """
         # Monte: since "time" is a dummy variable for the forecast data, 
         # we want to use "valid_time" here. 
-        #t = [list(self.datetime).index(date) for date in xds["valid_time"]]
-        
-        # Modifying for the original ufs2arco to account for non-unique values
-        this_ic = xds.attrs['init_time']
-        _id = self.source.trajectory_id_dict[this_ic]
-        t = np.where(self.trajectory_ids==_id)[0]
+        t = [list(self.datetime).index(date) for date in xds["valid_time"]]
         
         xds["time"] = xr.DataArray(
             t,
@@ -333,9 +328,9 @@ class Anemoi(Target):
         # it turns out that this is hard to do consistently with xarray and zarr
         # especially with this "write container" + "fill incrementally" workflow
         # so... let's just store "dates" during aggregate_stats
+        if "dates" in xds:
+            xds = xds.drop_vars("dates") 
         
-        # Monte: raised an error
-        #xds = xds.drop_vars("dates")
         
         return xds
 

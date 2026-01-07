@@ -4,6 +4,7 @@ from datetime import datetime
 import pandas as pd 
 import numpy as np
 import xarray as xr
+import json 
 
 def _geopotential_height_block(p, Tv, surface_elevation, Rd=287.05, g=9.80665):
     """Pure NumPy routine for one block; Dask will call this per-chunk."""
@@ -16,14 +17,14 @@ def _geopotential_height_block(p, Tv, surface_elevation, Rd=287.05, g=9.80665):
         z[..., k + 1] = z[..., k] + dz
     return z
 
-def compute_geopotential_height(ds, vertical_dim="level"):
+def compute_geopotential_height(ds, vertical_dim="level", return_as="dataset"):
     """
     Dask-safe version of explicit-loop geopotential height computation.
     """
     Rd = 287.05
     g = 9.80665
 
-    ds = ds.assign_coords({vertical_dim: np.arange(ds.sizes[vertical_dim])})
+   # ds = ds.assign_coords({vertical_dim: np.arange(ds.sizes[vertical_dim])})
     Tv = ds["temperature"] * (1.0 + 0.61 * ds["qv"])
     p  = ds["pressure"]
 
@@ -46,9 +47,12 @@ def compute_geopotential_height(ds, vertical_dim="level"):
     z.name = "geopotential_height"
     z.attrs["units"] = "m"
     
+    if return_as == "data_array":
+        return z 
+    
     return ds.assign(geopotential_height=z)
 
-def compute_composite_reflectivity(ds, vertical_dim='nVertLevels'):
+def compute_composite_reflectivity(ds, vertical_dim='nVertLevels', return_as = "dataset"):
     """
     Simplified version using only rain, snow, and graupel.
     This is often sufficient and more robust.
@@ -124,15 +128,22 @@ def compute_composite_reflectivity(ds, vertical_dim='nVertLevels'):
     # Clip unrealistic values
     composite_dbz = composite_dbz.clip(min=-10, max=80)
     
-    # Add to dataset
-    ds['composite_reflectivity'] = composite_dbz
-    ds['composite_reflectivity'].attrs = {
+    # Add metadata
+    composite_dbz.attrs = {
         'long_name': 'Composite Radar Reflectivity',
         'units': 'dBZ',
         'description': 'Column-maximum radar reflectivity from rain, snow, and graupel',
         'valid_range': '-10 to 80 dBZ',
         'note': 'Values below -10 dBZ indicate no significant precipitation',
     }
+    composite_dbz.name = 'composite_reflectivity'
+    
+    if return_as == "data_array":
+        return composite_dbz 
+    
+    # Add to dataset
+    ds = ds.copy()
+    ds['composite_reflectivity'] = composite_dbz
     
     return ds
 
@@ -237,7 +248,7 @@ def parse_order_file(order_filename : str):
     idx = np.argsort(stamps)
     stamps_ordered = stamps[idx]
 
-    return stamps_ordered, idx.tolist()  
+    return stamps_ordered, idx.tolist(), stamps
 
 
 def get_expected_times(xds: xr.Dataset, time_resolution: str, n_steps: int) -> pd.DatetimeIndex:
@@ -346,4 +357,58 @@ def subsample_by_month(
     ).sort_index()
     
     return df_sub.drop(columns=["month"])
+
+def save_times_dict_json(d: dict, path: str) -> None:
+    serializable = {k: [t.isoformat() for t in v.to_pydatetime()] for k, v in d.items()}
+    with open(path, "w") as f:
+        json.dump(serializable, f)
+
+def load_times_dict_json(path: str) -> dict[str, pd.DatetimeIndex]:
+    with open(path, "r") as f:
+        raw = json.load(f)
+    return {k: pd.DatetimeIndex(pd.to_datetime(v)) for k, v in raw.items()}
+
+
+def save_missing_times_parquet(d: dict, path: str) -> None:
+    rows = []
+    for key, times in d.items():
+        for t in times:
+            rows.append({"key": key, "time": pd.Timestamp(t)})
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["time"] = pd.to_datetime(df["time"])
+
+    df.to_parquet(path, index=False)
+
+def load_missing_times_parquet(path: str) -> dict[str, set[pd.Timestamp]]:
+    try:
+        df = pd.read_parquet(path)
+    except FileNotFoundError:
+        return {}
+
+    out = {}
+    for key, g in df.groupby("key"):
+        out[key] = set(pd.to_datetime(g["time"]))
+
+    return out
+
+def save_missing_indices_json(missing_indices_per_init, path):
+    serializable = {
+        k: sorted(map(int, v))
+        for k, v in missing_indices_per_init.items()
+    }
+    with open(path, "w") as f:
+        json.dump(serializable, f, indent=2)
+
+
+def load_missing_indices_json(path):
+    with open(path) as f:
+        data = json.load(f)
+    return {
+        k: set(v)
+        for k, v in data.items()
+    }
+
+
     

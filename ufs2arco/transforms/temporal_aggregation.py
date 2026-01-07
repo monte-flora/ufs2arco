@@ -1,63 +1,90 @@
 import xarray as xr 
 
 def temporal_aggregation(
-    xds:xr.Dataset,
-    reduce_map : dict, 
-    resample_kwargs: dict, 
-) ->xr.Dataset:
+    xds: xr.Dataset,
+    reduce_map: dict,
+    time_coord: xr.DataArray | None = None,
+) -> xr.Dataset:
     """
-    Using xarray.resample, aggregate data temporally 
-    (e.g., reducing 5-min data to a 15-min timestep). 
-
-    Each variable in the dataset is mapped to one or more reduction
-    operations (e.g., "sum", "max", "mean") according to the
-    `reduce_map`. The function resamples those variables using the
-    provided resample frequency and replaces them in the dataset
-    with new variables whose names indicate the aggregation applied.
+    Perform temporal aggregation over the time dimension,
+    preserving latitude/longitude and keeping a length-1 time dimension.
 
     Parameters
     ----------
     xds : xr.Dataset
-        Input dataset containing variables to aggregate.
+        Dataset with a time dimension (e.g., 5-min slices)
     reduce_map : dict
-        Mapping of reduction name to a list of variable names.
-        Example: {"sum": ["precip"], "max": ["temperature"]}.
-    resample_kwargs : dict
-        Keyword arguments passed to ``xarray.Dataset.resample``,
-        typically specifying the resampling dimension and frequency.
-        Example: {"time": "15min"}.
-
-    Returns
-    -------
-    xr.Dataset
-        A new dataset with aggregated variables. Original variables
-        listed in `reduce_map` are dropped and replaced with new
-        variables named ``{var}_{freq}_{stat}``. Attributes
-        are preserved, and a new ``long_name`` attribute is assigned
-        indicating the aggregation performed.
-
-    Notes
-    -----
-    - Variables not listed in `reduce_map` remain unchanged.
-    - If a variable in `reduce_map` is not present in the dataset,
-      it is silently skipped.
-    - Works lazily with Dask-backed datasets; computation is deferred
-      until explicitly triggered.
+        {"sum": ["apcp"], "max": ["reflectivity"], ...}
+    time_coord : xr.DataArray, optional
+        Time coordinate to use for the aggregated output.
+        If None, uses the last time in xds.
     """
-    timestr = resample_kwargs["time"]
-    
-    outs = {}
-    for xr_stat, varlist in reduce_map.items():
-        varlist = [varlist] if isinstance(varlist, str) else varlist 
-        for varname in varlist:
-            if varname in xds:
-                new_name = f"{varname}_{timestr}_{xr_stat}"
-                reduced = getattr(xds[varname].resample(**resample_kwargs), xr_stat)(keep_attrs=True)
-                long_name = xds[varname].attrs.get("long_name", varname)
-                reduced.attrs["long_name"] = f"{timestr} {xr_stat} of {long_name}"
-                outs[new_name] = reduced
-                
-    return xr.Dataset(outs).transpose("time", ...) 
 
-    
-    
+    if "time" not in xds.dims:
+        raise ValueError("temporal_aggregation requires a 'time' dimension")
+
+    # Determine output time coordinate
+    if time_coord is None:
+        time_coord = xds["time"].isel(time=-1)
+
+    out_vars = {}
+
+    # ------------------------------------------------------------------
+    # Aggregate requested variables
+    # ------------------------------------------------------------------
+    for stat, varlist in reduce_map.items():
+        varlist = [varlist] if isinstance(varlist, str) else varlist
+
+        for varname in varlist:
+            if varname not in xds:
+                continue
+
+            da = xds[varname]
+
+            if stat == "sum":
+                reduced = da.sum(dim="time", keep_attrs=True)
+            elif stat == "mean":
+                reduced = da.mean(dim="time", keep_attrs=True)
+            elif stat == "max":
+                reduced = da.max(dim="time", keep_attrs=True)
+            elif stat == "min":
+                reduced = da.min(dim="time", keep_attrs=True)
+            else:
+                reduced = da.reduce(getattr(np, stat), dim="time", keep_attrs=True)
+
+            new_name = f"{varname}_15min_{stat}"
+            reduced = reduced.rename(new_name)
+
+            long_name = da.attrs.get("long_name", varname)
+            reduced.attrs["long_name"] = f"15-min {stat} of {long_name}"
+
+            #  restore time dimension (length 1)
+            reduced = reduced.expand_dims(time=[time_coord.values])
+
+            out_vars[new_name] = reduced
+
+    # ------------------------------------------------------------------
+    # Pass through non-time-dependent variables (lat, lon, masks, etc.)
+    # ------------------------------------------------------------------
+    passthrough = {
+        v: xds[v]
+        for v in xds.data_vars
+        if "time" not in xds[v].dims
+    }
+
+    # ------------------------------------------------------------------
+    # Build output dataset
+    # ------------------------------------------------------------------
+    out = xr.Dataset(
+        data_vars={**out_vars, **passthrough},
+        coords={
+            "time": ("time", [time_coord.values]),
+            **{k: v for k, v in xds.coords.items() if k != "time"},
+        },
+        attrs=xds.attrs,
+    )
+
+    return out
+
+
+
