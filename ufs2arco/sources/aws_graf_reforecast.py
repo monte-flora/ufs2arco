@@ -28,7 +28,7 @@ from .graf_utils import (parse_order_file,
                     spherical_to_lat_lon,
                     subsample_by_month,
                     compute_composite_reflectivity,
-                    compute_geopotential_height,
+                    compute_geopotential,
                     load_times_dict_json,
                     load_missing_times_parquet,
                     load_missing_indices_json     
@@ -61,8 +61,8 @@ class AWSGRAFArchive(Source):
         "qs", "qv", "sh2o", "skintemp", "smois", "snow_ratio", "snowh", "swdnb",
         "swdnb01h", "swdnbdn", "swdnbdn01h", "t2m", "temperature", "theta",
         "tpi", "tslb", "u10", "uReconstructMeridional", "uReconstructZonal",
-        "v10", "visibility", "w", "windgust10m", "composite_reflectivity",
-        "geopotential_height",
+        "v10", "visibility", "w", "windgust10m", "comp_refl",
+        "geopot",
         
         # 05min variables
         "apcp_bucket", "conv_bucket",
@@ -126,6 +126,14 @@ class AWSGRAFArchive(Source):
     }
     
     TIMESTEP_RATIO = 15 // 5 
+    
+    # Imputed value for the soil moisture variables over the ocean 
+    SOIL_VARS = ["smois", "tslb", "climo_soiltemp"]
+    SOIL_IMPUTED_MEAN_VALUES = { 
+        'climo_soiltemp' : 287.9046,
+        'smois' : 0.2675,
+        'tslb' : 284.4978
+    }
     
     @property
     def name(self) -> str:
@@ -226,6 +234,10 @@ class AWSGRAFArchive(Source):
         # The init_time timestamps were set as the index.
         # Convert to strings. 
         self.init_time_dts = pd.to_datetime(self.init_times_df.index)
+        self._init_time_dt_map = {
+            ic: pd.to_datetime(ic.split("_")[0], format="%Y%m%d%H")
+            for ic in self.init_time
+        }
         
         self.variables = variables
         self.static_variables = static_variables 
@@ -243,7 +255,7 @@ class AWSGRAFArchive(Source):
         # initial slicing based on geographic area, but 
         # below add based on lead_time and vertical levels.
         slices = { 
-            "isel": {"cell" : self.geo_extent_indices},
+            "isel": {},  #{"cell" : self.geo_extent_indices},
             "sel": {},
         }
         
@@ -266,18 +278,32 @@ class AWSGRAFArchive(Source):
         
         self._zarr_cache_per_init_time = {}
         self._perm_file_cache_per_init_time = {}
+        self._base_xds_cache_per_init_time = {}
+        self._perm_index_cache = {}
 
     def __len__(self):
         """Return the number of valid times"""
         return len(self.valid_times)
     
     def _cache_geo_extent(self): 
-        """Pre-compute the geo extent mask""" 
+        """
+        Pre-compute the geo extent mask and permanently slice static variables 
+        to reduce memory usage.
+        """ 
         b = self.geographic_extent 
         # lat/lon stored as (["cell"], data)
         lat, lon = self.lat_lon['latitude'][-1], self.lat_lon['longitude'][-1]
         mask = (lat >= b["lat_min"]) & (lat <= b["lat_max"]) & (lon >= b["lon_min"]) & (lon <= b["lon_max"]) 
-        self.geo_extent_indices = np.nonzero(mask)[0]    
+        self.geo_extent_indices = np.nonzero(mask)[0] 
+        
+        # Memory Optimization: Slice the static variables in memory now
+        # so we don't carry the global static fields
+        for k, v in self.lat_lon.items():
+            self.lat_lon[k] = (v[0], v[1][self.geo_extent_indices])
+            
+        if self.static_vars:
+            for k, v in self.static_vars.items():
+                self.static_vars[k] = (v[0], v[1][self.geo_extent_indices])
         
     def _compute_valid_times(self) -> pd.DatetimeIndex:
         """Determine the valid times for all samples in the final dataset 
@@ -377,7 +403,9 @@ class AWSGRAFArchive(Source):
                         forecast_step: int
       ):
         """Returns the valid time w.r.t to a 15min time step"""
-        init_dt = pd.to_datetime(init_time.split("_")[0], format="%Y%m%d%H")
+        init_dt = self._init_time_dt_map.get(init_time)
+        if init_dt is None:
+            init_dt = pd.to_datetime(init_time.split("_")[0], format="%Y%m%d%H")
         freq = pd.to_timedelta(self.FREQ)   # e.g. "15min"
         valid_time = init_dt + forecast_step * freq
         
@@ -400,7 +428,7 @@ class AWSGRAFArchive(Source):
             
         return xds
     
-    def rename_wind_vars(self, xds : xr.Dataset)->xr.Dataset:
+    def maybe_rename_wind_vars(self, xds : xr.Dataset)->xr.Dataset:
         valid_map = {
             k: v for k, v in self.WIND_VAR_RENAMER.items() if k in xds.data_vars
         }
@@ -414,13 +442,15 @@ class AWSGRAFArchive(Source):
         Add multiple diagnostic variables efficiently.
         Reuses loaded variables across computations.
         """
-        if 'composite_reflectivity' in variables_to_add and 'composite_reflectivity' not in xds.data_vars:
+        if 'comp_refl' in variables_to_add and 'comp_refl' not in xds.data_vars:
             # ['pressure', 'temperature', 'qs', 'qr', 'qg', 'qv']
             xds = compute_composite_reflectivity(xds, vertical_dim=vertical_dim)
     
-        if 'geopotential_height' in variables_to_add and 'geopotential_height' not in xds.data_vars:
-            #['pressure', 'temperature', 'qv', 'surface_elevation']
-            xds = compute_geopotential_height(xds)
+        if 'geopot' in variables_to_add and 'geopot' not in xds.data_vars:
+            #['pressure', 'temperature', 'qv', 'surface_elevation', 'mslp', 't2m']
+            target_dims = ('time', 'cell', 'level') 
+            xds = compute_geopotential(xds)
+            xds['geopot'] = xds['geopot'].transpose(*target_dims)
     
         return xds
     
@@ -435,25 +465,29 @@ class AWSGRAFArchive(Source):
     
     def select_time(self, xds: xr.Dataset, forecast_step : int):
         if self.file_freqstr == "15m":
-            xds = xds.isel(time = [step])
+            xds = xds.isel(time=[forecast_step])
         else:
             # For the temporal aggregation of the precipitation fields 
             # we want the 15-min accumulation since the previous time step.
             # However, GRAF precip buckets are accumulated since the previous 
             # time step, so we do not include the first 5-min timestep. 
-            time_idx_rng = self.get_5m_steps(step)
+            time_idx_rng = self.get_5m_steps(forecast_step)
             xds = xds.isel(time = time_idx_rng) 
             
         return xds
     
     def get_nan_xds(self, xds : xr.Dataset)->xr.Dataset:
-        # Replace all data variables with NaNs
+        # Performance update: Create new variables from coords/shapes only
+        # to avoid triggering reads on the source xds and preserve dask chunks.
+        new_vars = {}
         for var in xds.data_vars:
-            xds[var] = xr.full_like(xds[var], fill_value=float("nan"))
-        
-        return xds 
+            dtype = xds[var].dtype
+            if not np.issubdtype(dtype, np.floating):
+                dtype = np.float32
+            new_vars[var] = xr.full_like(xds[var], np.nan, dtype=dtype)
+            
+        return xr.Dataset(new_vars, coords=xds.coords)
     
-
     def select_time_with_perm(
         self,
         xds: xr.Dataset,
@@ -473,82 +507,123 @@ class AWSGRAFArchive(Source):
             )
         )
         
-        # times is the expected times while time_indices
-        # are the permuted order as the data is stored.
-        times, time_indices, unordered_times = parse_order_file(perm_file)
+        # time_indices are the permuted order as the data is stored.
+        # time_to_perm maps logical timestamps to permuted indices.
+        cache_key = (init_time, self.file_freqstr)
+        cache_entry = self._perm_index_cache.get(cache_key)
+        if cache_entry is None:
+            ordered_times, time_indices, unordered_times = parse_order_file(perm_file)
+            time_to_perm = {pd.Timestamp(t): i for i, t in enumerate(unordered_times)}
+            cache_entry = {
+                "time_indices": time_indices,
+                "reference_idx": time_indices[0] if time_indices else 0,
+                "time_to_perm": time_to_perm,
+                "ordered_times": ordered_times,
+            }
+            self._perm_index_cache[cache_key] = cache_entry
 
-        # Map logical forecast step -> stored (permuted) index
-        time_idx_map = {
-            i: time_indices[i]
-            for i in range(len(time_indices))
-        }
+        time_indices = cache_entry["time_indices"]
+        reference_idx = cache_entry["reference_idx"]
+        time_to_perm = cache_entry["time_to_perm"]
+
+        valid_time = pd.Timestamp(self.get_valid_time(xds, init_time, forecast_step))
+        
+        print(forecast_step, reference_idx, time_to_perm, valid_time)
         
         if self.file_freqstr == "15m":
             # Is this forecast step missing? 
             if forecast_step in self.missing_indices_per_init[f"{init_time}_{self.file_freqstr}"]:
-                reference_idx = next(iter(time_idx_map.values()))
                 xds = xds.isel(time=[reference_idx])
                 xds = self.get_nan_xds(xds)
                 return xds 
             else:
-                perm_step = time_idx_map.get(forecast_step, None)
-                ####print(unordered_times[perm_step])
-                xds = xds.isel(time=[perm_step])
-        else:
-            # These are the logical steps of the 5min dataset 
-            # for a given 15min step, which need to be 
-            # converted to the permutation steps
-            logical_time_idx_rng = self.get_5m_steps(forecast_step)
-            for s in logical_time_idx_rng:
-                # If even one time step in missing in this range, return a NaN.
-                # Probably best not to compute temporal averages with incomplete data :)
-                if s in self.missing_indices_per_init[f"{init_time}_{self.file_freqstr}"]:
-                    reference_idx = next(iter(time_idx_map.values()))
+                perm_step = time_to_perm.get(valid_time)
+                if perm_step is None:
                     xds = xds.isel(time=[reference_idx])
                     xds = self.get_nan_xds(xds)
                     return xds
+                xds = xds.isel(time=[perm_step])
+        else:
+            # Map the 3 logical 5-min timestamps to permuted indices.
+            # We accumulate over valid_time-10, valid_time-5, valid_time.
+            freq_5m = pd.to_timedelta("5min")
+            expected_times = [
+                valid_time - 2 * freq_5m,
+                valid_time - 1 * freq_5m,
+                valid_time,
+            ]
             
-            perm_rng = [time_idx_map[step] for step in logical_time_idx_rng]
+            print(expected_times) 
             
-            # Since there are missing times, we can't expect the step, even when
-            # permuted to return the corresponding actual times. 
-            #print([unordered_times[s] for s in perm_rng], logical_time_idx_rng)
-            
+            perm_rng = []
+            for t in expected_times:
+                perm_idx = time_to_perm.get(pd.Timestamp(t))
+                if perm_idx is None:
+                    # No tolerance for missing timesteps, 
+                    # if its missing return NaNs. 
+                    xds = xds.isel(time=[reference_idx])
+                    xds = self.get_nan_xds(xds)
+                    return xds
+                perm_rng.append(perm_idx)
+
             xds = xds.isel(time=perm_rng)
               
         return xds 
 
-        
-    def soil_to_nans_over_ocean(self, xds:xr.Dataset)->xr.Dataset: 
-        # Convert smois, tslb, climo_soiltemp to NaNs over the ocean 
-        # To be imputed to the mean during Anemoi training!
-        # Boolean mask: True over ocean, False over land
-        if "land_sea_mask" not in xds:
-            return xds 
+    def maybe_soil_impute_over_ocean(self, xds: xr.Dataset) -> xr.Dataset:
+        """
+        Imputes soil variables over the ocean with specific global mean values 
+        instead of masking them with NaNs.
+        """  
+        if 'land_sea_mask' not in xds.data_vars:
+            return xds
         
         if self._ocean_mask is None:
+            # Create boolean mask: True where ocean (0), False where land (1)
             self._ocean_mask = xds["land_sea_mask"] == 0
-        
-        # Soil-related variables that should be masked
-        soil_vars = ["smois", "tslb", "climo_soiltemp"]
-
+    
         updates = {}
-
-        for var in soil_vars:
+        for var, mean_val in self.SOIL_IMPUTED_MEAN_VALUES.items():
             if var not in xds:
-                continue  # skip missing soil variables
+                continue 
 
             da = xds[var]
 
-            # Broadcast land_sea_mask to match da dimensions
-            # (works for 1D cell dims OR 2D dims like [cell, nSoilLevels])
+            # Broadcast mask to match variable dimensions 
+            # (Necessary because soil vars often have a depth dimension 'level' or 'k')
             ocean_mask_b = self._ocean_mask.broadcast_like(da)
 
-            # Apply mask: over ocean → NaN, land → original value
-            updates[var] = da.where(~ocean_mask_b)
+            # condition (~ocean_mask_b): Where True (Land), keep original data.
+            # other (mean_val): Where False (Ocean), replace with mean_val.
+            updates[var] = da.where(~ocean_mask_b, other=mean_val)
 
-        # Return dataset with updated soil fields
         return xds.assign(**updates)
+    
+    def maybe_rescale_cloud_cover(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Searches for variables containing 'total_cloud_cover' and converts 
+        them from percentage (0-100) to fraction (0-1).
+        """
+        updates = {}
+        for var_name in ds.data_vars:
+            if "total_cloud_cover" in var_name:
+                da = (ds[var_name] / 100.0).copy()
+                da.attrs = {**ds[var_name].attrs, "units": "fraction", "valid_range": "0-1"}
+                updates[var_name] = da
+
+        if not updates:
+            return ds
+
+        return ds.assign(**updates)
+    
+    def add_static_vars(self, xds: xr.Dataset)->xr.Dataset:
+        # Add static variables (These are now already pre-sliced in __init__)
+        for v in self.lat_lon:
+            xds[v] = self.lat_lon[v]
+        for v in self.static_vars:
+            xds[v] = self.static_vars[v]
+            
+        return xds 
     
     def open_static_vars(self, path):
         pass
@@ -556,9 +631,6 @@ class AWSGRAFArchive(Source):
     def _open_zarr(self, dims: dict):
         zarr_path, perm_file = self._build_path(dims['init_time'])
         if "twc-graf-reforecast" in self.BUCKET:
-            
-            
-            
             xds = xr.open_zarr(
                     zarr_path,
                     # Must be False to prevent .zmetadata issues!
@@ -576,6 +648,21 @@ class AWSGRAFArchive(Source):
                 )
             
         return xds, perm_file
+    
+    def _prepare_base_xds(self, xds: xr.Dataset) -> xr.Dataset:
+        # Optimization: Subset variables immediately to reduce metadata overhead
+        # Include diag vars components to ensure they are available for computation
+        required_vars = set(self.variables)
+        if 'comp_refl' in self.variables:
+            required_vars.update(['pressure', 'temperature', 'qv', 'qs', 'qr', 'qg', 'mslp'])
+        if 'geopot' in self.variables:
+            required_vars.update(['pressure', 'temperature', 'qv', 'mslp', 't2m'])
+
+        vars_to_keep = [v for v in required_vars if v in xds.data_vars]
+        xds = xds[vars_to_keep]
+        xds = self.rename_coords(xds)
+        xds = self.add_level_coord(xds)
+        return xds
 
     def open_sample_dataset(
         self, 
@@ -587,70 +674,49 @@ class AWSGRAFArchive(Source):
         step = dims["forecast_step"]
         init_time = dims['init_time']
              
-        if init_time in self._zarr_cache_per_init_time:
-            xds = self._zarr_cache_per_init_time[init_time]
+        if init_time in self._base_xds_cache_per_init_time:
+            xds = self._base_xds_cache_per_init_time[init_time]
             perm_file = self._perm_file_cache_per_init_time[init_time]
         else:
-            xds, perm_file = self._open_zarr(dims)   
-            self._zarr_cache_per_init_time[init_time] = xds
+            xds, perm_file = self._open_zarr(dims)
+            xds = self._prepare_base_xds(xds)
+            self._base_xds_cache_per_init_time[init_time] = xds
             self._perm_file_cache_per_init_time[init_time] = perm_file 
             
-        xds = self.rename_coords(xds)
         valid_time = self.get_valid_time(xds,  **dims)   
         
         if "twc-graf-reforecast" in self.BUCKET:
             xds = self.select_time_with_perm(xds, perm_file, **dims)
         else:
             xds = self.select_time(xds, step)
-            
-        # TODO: Is this the optimal way to add the static variables? 
-        # Add the latitude and longitudes
-        # and optionally add static variables. 
-        for v in self.lat_lon:
-            xds[v] = self.lat_lon[v]
-        for v in self.static_vars:
-            xds[v] = self.static_vars[v]
- 
-        # Note: for composite reflectivity, geopotential_heights
-        # added pressure, temperature, qs, qr, and qg
-        # but remove them after the computation below.          
-        diag_vars = ['composite_reflectivity', 'geopotential_height']
-        temp_var_list = [v for v in self.variables if v not in diag_vars]
         
-        if 'composite_reflectivity' in self.variables:
-            # 15-min dataset
-            xds = xds[temp_var_list + ['pressure', 'temperature', 'qv', 'qs', 'qr', 'qg']]
-        else:
-            try:
-                xds = xds[self.variables] 
-            except:
-                print(f'{xds=} {self.file_freqstr=} {dims=}')
-      
-        xds = self.add_level_coord(xds) 
-          
+        # -----------------------------------------------------------------
+        # OPTIMIZATION: Horizontal Slice FIRST
+        # Safe because all vars (even staggered) share the 'cell' dim.
+        # -----------------------------------------------------------------
+        if hasattr(self, 'geo_extent_indices'):
+            xds = xds.isel(cell=self.geo_extent_indices)
+        
+        # Add static variables (These are now already pre-sliced in __init__)
+        xds = self.add_static_vars(xds)
+        
         if self.destagger_kwargs is not None:
-            ###logger.info(f"Performing destaggering")
-            xds = destagger(xds, **self.destagger_kwargs) 
-        
-        xds = self.apply_slices(xds)
-        
-        # To save memory only compute diagnostics after the slicing.
-        # This be could be hurting comp. refl, but hopefully 
-        # not detrimentally!
-        if 'composite_reflectivity' in self.variables:
-            xds = self.add_diagnostic_variables(xds, self.variables)
+            xds = destagger(xds, **self.destagger_kwargs)
 
+        # its a big computation hit, but we need all vertical levels
+        # to compute the comp refl and geopot correctly :( 
+        if 'comp_refl' in self.variables:
+            xds = self.add_diagnostic_variables(xds, self.variables)
             # Keep only the variables of interest 
             # after computing the diagnostic variables. 
-            xds = xds[self.variables] 
+            xds = xds[self.variables]     
             
-        xds = self.soil_to_nans_over_ocean(xds)    
-        
-        xds = self.rename_wind_vars(xds)
-        
+        xds = self.apply_slices(xds)
+        xds = self.maybe_soil_impute_over_ocean(xds)   
+        xds = self.maybe_rename_wind_vars(xds)
         if self.temporal_aggregation_kwargs:
-            xds = temporal_aggregation(xds, **self.temporal_aggregation_kwargs)
-
+            xds = temporal_aggregation(xds, **self.temporal_aggregation_kwargs)  
+        xds = self.maybe_rescale_cloud_cover(xds)
         xds = self.add_valid_time_to_dataset(xds, valid_time)
             
         # Adding this attribute to find unique trajectory id 

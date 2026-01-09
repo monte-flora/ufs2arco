@@ -6,235 +6,209 @@ import numpy as np
 import xarray as xr
 import json 
 
-def _geopotential_height_block(p, Tv, surface_elevation, Rd=287.05, g=9.80665):
-    """Pure NumPy routine for one block; Dask will call this per-chunk."""
-    nz = p.shape[-1]
-    z = np.zeros_like(p, dtype=np.float32)
-    z[..., 0] = surface_elevation
-    for k in range(nz - 1):
-        Tv_bar = 0.5 * (Tv[..., k] + Tv[..., k + 1])
-        dz = (Rd * Tv_bar / g) * np.log(p[..., k] / p[..., k + 1])
-        z[..., k + 1] = z[..., k] + dz
-    return z
-
-def compute_geopotential_height(ds, vertical_dim="level", return_as="dataset"):
+def compute_geopotential(ds, z_dim="level", surface_elev_var="surface_elevation", return_as="dataset"):
     """
-    Dask-safe version of explicit-loop geopotential height computation.
+    Dask-compatible (lazy) geopotential computation.
+    Uses vectorized shift/cumsum instead of loops to preserve the Dask graph.
     """
+    # 1. Constants
     Rd = 287.05
     g = 9.80665
+    
+    # 2. Lazy Variable Extraction (Preserve float32 when possible)
+    # dask='allowed' ensures we don't trigger compute on load
+    base_dtype = np.float64 if ds["pressure"].dtype == np.float64 else np.float32
+    p = ds["pressure"].astype(base_dtype)
+    t = ds["temperature"].astype(base_dtype)
+    qv = ds["qv"].astype(base_dtype)
+    mslp = ds["mslp"].astype(base_dtype)
+    t2m = ds["t2m"].astype(base_dtype)
+    
+    if surface_elev_var in ds:
+        z_sfc = ds[surface_elev_var].astype(base_dtype)
+    else:
+        z_sfc = ds.coords[surface_elev_var].astype(base_dtype)
 
-   # ds = ds.assign_coords({vertical_dim: np.arange(ds.sizes[vertical_dim])})
-    Tv = ds["temperature"] * (1.0 + 0.61 * ds["qv"])
-    p  = ds["pressure"]
+    # 3. Virtual Temperature (Lazy Element-wise)
+    tv = t * (1.0 + 0.608 * qv)
 
-    # ensure surface_elevation broadcasts to all dims
-    se = ds["surface_elevation"]
-    se_expanded = se.broadcast_like(p.isel({vertical_dim: 0}))
+    # 4. The "Elevator" Calculation (Lazy Element-wise)
+    # Estimate Psfc to get the jump from terrain to the first model level
+    t_mean_sfc = t2m + (0.0065 * z_sfc / 2.0) 
+    psfc = mslp / np.exp((g * z_sfc) / (Rd * t_mean_sfc))
 
-    z = xr.apply_ufunc(
-        _geopotential_height_block,
-        p,
-        Tv,
-        se_expanded,
-        input_core_dims=[[vertical_dim], [vertical_dim], []],
-        output_core_dims=[[vertical_dim]],
-        dask="parallelized",
-        output_dtypes=[np.float32],
-        kwargs={"Rd": Rd, "g": g},
-    )
+    # Calculate the thickness of the "ghost layer" between Surface and Level 0
+    # We select Level 0 lazily
+    p0 = p.isel({z_dim: 0})
+    tv0 = tv.isel({z_dim: 0})
+    d_z0 = (Rd * tv0 / g) * np.log(psfc / p0)
+    
+    # This is the height of the first model level
+    z_base = z_sfc + d_z0
 
-    z.name = "geopotential_height"
-    z.attrs["units"] = "m"
+    # ---------------------------------------------------------
+    # 5. Vectorized Integration (The "Loop" Replacement)
+    # ---------------------------------------------------------
+    
+    # We calculate the thickness between level k and k+1 for ALL k at once.
+    # We use .shift() to align level k with k+1.
+    
+    # Shift UP to get the "next" level (k+1) aligned with "current" level (k)
+    # Note: The last element becomes NaN, which is fine (no layer above top)
+    tv_next = tv.shift({z_dim: -1})
+    p_next = p.shift({z_dim: -1})
+    
+    # Average Tv between k and k+1
+    tv_bar = 0.5 * (tv + tv_next)
+    
+    # Log pressure thickness
+    # Result is an array where index 'k' holds the thickness from k to k+1
+    dlogp = np.log(p / p_next)
+    
+    # Calculate Hypsometric Thickness for every layer
+    layer_thickness = (Rd * tv_bar / g) * dlogp
+
+    # ---------------------------------------------------------
+    # 6. Accumulation (cumsum)
+    # ---------------------------------------------------------
+    
+    # We now have an array of thicknesses.
+    # We need to sum them up. 
+    # But layer_thickness[0] is the distance from Lev0 to Lev1.
+    # That distance should be added to Lev1, not Lev0.
+    
+    # We shift DOWN by 1.
+    # Index 0 becomes NaN (we fill with 0, because Lev0 has 0 accumulation from itself)
+    # Index 1 receives the thickness from Lev0->Lev1.
+    thickness_aligned = layer_thickness.shift({z_dim: 1}).fillna(0.0)
+    
+    # Cumulative Sum along the vertical dimension
+    # This is efficient in Dask
+    z_accumulation = thickness_aligned.cumsum(dim=z_dim)
+    
+    # 7. Add the Base Height
+    # Broadcasting z_base (2D) across z_accumulation (3D) is handled by xarray
+    z_final = z_base + z_accumulation
+
+    z_final *= 9.8 #Convert from m to gpm
+    
+    # 8. Return
+    z_final.name = "geopot"
+    z_final.attrs["units"] = "m2 s-2"
+    
+    # Cast back to float32 only at the very end to save memory on write
+    z_final= z_final.astype(np.float32)
+    
     
     if return_as == "data_array":
-        return z 
+        return z_final
     
-    return ds.assign(geopotential_height=z)
+    return ds.assign(geopot=z_final)
 
-def compute_composite_reflectivity(ds, vertical_dim='nVertLevels', return_as = "dataset"):
+def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"):
     """
-    Simplified version using only rain, snow, and graupel.
-    This is often sufficient and more robust.
-    
-    Parameters:
-    -----------
-    ds : xarray.Dataset
-        Dataset containing qr, qs, qg, pressure, temperature
-    vertical_dim : str
-        Name of the vertical dimension
-    
-    Returns:
-    --------
-    ds : xarray.Dataset
-        Dataset with added 'composite_reflectivity' variable
+    Computes Composite Reflectivity with a 'Bright Band' heuristic.
+    Boosts snow/graupel reflectivity in the melting layer (0C to 5C).
     """
-    # Gas constant for dry air
-    R_d = 287.0
+    min_comp_refl_val = 0.0
+    R_d = 287.05
     
-    # Calculate air density (kg/m³)
-    rho = ds['pressure'] / (R_d * ds['temperature'])
+    # Lazy Load
+    p = ds['pressure']
+    t = ds['temperature']
+    qr = ds['qr']
+    qs = ds['qs']
+    qg = ds['qg']
     
-    # Reflectivity coefficients (from WSR-88D relationships)
+    # Density
+    rho = p / (R_d * t)
+
+    # --- 1. Coefficients (Standard) ---
+    # Rain
     a_rain = 3.63e9
     b_rain = 1.75
+    
+    # Snow/Graupel (Intrinsic coefficients)
     a_snow = 2.02e10
     b_snow = 2.0
-    a_graupel = 4.33e8
-    b_graupel = 1.66
     
-    # Calculate reflectivity factor Z (mm^6/m^3)
-    # Only compute where mixing ratios are significant
-    # Minimum mixing ratio threshold (kg/kg)
-    # Below this, consider it no precipitation
-    min_mixing_ratio = 1e-7  # 0.1 g/kg
+    # Treating graupel more like hail
+    a_graupel = 3.8e9 #4.33e8
+    b_graupel = 1.75 #1.66
     
-    # Calculate reflectivity factor Z (mm^6/m^3) for each species
-    Z_rain = xr.where(
-        ds['qr'] > min_mixing_ratio,
-        a_rain * (rho * ds['qr']) ** b_rain,
-        0.0
+    # --- 2. Dynamic Dielectric Factor (The Bright Band Logic) ---
+    
+    # Base factor for Dry Ice (Frozen)
+    # |K|^2_ice / |K|^2_water ~= 0.176 / 0.93 ~= 0.19
+    dielectric_dry = 0.19
+    
+    # Factor for Wet Ice (Melting)
+    # Melting snow surfaces scatter like water.
+    dielectric_wet = 1.0 
+    
+    # Define Melting Zone: 273.15K (0C) to 278.15K (+5C)
+    # We create a mask where snow is melting.
+    # Note: We assume snow exists in this layer (handled by 'qs' term later).
+    is_melting = (t >= 273.15) & (t <= 278.15)
+    
+    # Create a spatially varying factor map
+    # If melting: use 1.0 (Wet). If frozen: use 0.19 (Dry).
+    dielectric_factor = xr.where(
+        is_melting,
+        dielectric_wet,
+        dielectric_dry
     )
+
+    # --- 3. Compute Z for each species ---
     
-    Z_snow = xr.where(
-        ds['qs'] > min_mixing_ratio,
-        a_snow * (rho * ds['qs']) ** b_snow,
-        0.0
-    )
+    # Rain (Always liquid, factor = 1.0 implicit in coefficients)
+    Z_rain = a_rain * (rho * qr)**b_rain
     
-    Z_graupel = xr.where(
-        ds['qg'] > min_mixing_ratio,
-        a_graupel * (rho * ds['qg']) ** b_graupel,
-        0.0
-    )
+    # Snow (Apply dynamic dielectric factor)
+    # In the melting layer, this term jumps up by ~5x (approx 7 dB)
+    Z_snow = (a_snow * (rho * qs)**b_snow) * dielectric_factor
     
-    # Total reflectivity
+    # Graupel (Apply dynamic dielectric factor)
+    Z_graupel = (a_graupel * (rho * qg)**b_graupel) * dielectric_factor
+
+    # --- 4. Total and Convert ---
+    
     Z_total = Z_rain + Z_snow + Z_graupel
     
-    # Convert to dBZ
-    # HRRR uses -10 dBZ as minimum (no echo value)
-    min_Z = 1e-1  # Z = 0.1 corresponds to -10 dBZ
+    # Floor for log safety (-10 dBZ)
+    Z_min_threshold = 0.1 
     
-    # Use where to avoid log10(0) or log10(negative)
+    # We clip Z_total inside the log function. 
+    # This prevents log10(0) from ever happening.
+    # The 'where' logic ensures we still effectively apply the threshold.
+    Z_safe = Z_total.clip(min=Z_min_threshold)
+    
     dbz_3d = xr.where(
-        Z_total >= min_Z,
-        10.0 * np.log10(Z_total.clip(min=min_Z)),  # Clip as safety
-        -10.0  # HRRR's "no echo" value
+        Z_total > Z_min_threshold,
+        10.0 * np.log10(Z_safe),
+        min_comp_refl_val
     )
     
-    # Composite (column maximum), ignoring NaN
+    # Composite
     composite_dbz = dbz_3d.max(dim=vertical_dim)
     
-    # Clip unrealistic values
+    # Clip unreasonable values 
     composite_dbz = composite_dbz.clip(min=-10, max=80)
     
-    # Add metadata
+    composite_dbz.name = 'comp_refl'
     composite_dbz.attrs = {
-        'long_name': 'Composite Radar Reflectivity',
-        'units': 'dBZ',
+        'units': 'dBZ', 
         'description': 'Column-maximum radar reflectivity from rain, snow, and graupel',
-        'valid_range': '-10 to 80 dBZ',
-        'note': 'Values below -10 dBZ indicate no significant precipitation',
+        'note': 'Includes heuristic bright-band enhancement in melting layer (0-5C)'
     }
-    composite_dbz.name = 'composite_reflectivity'
+    
+    composite_dbz = composite_dbz.astype(np.float32)
     
     if return_as == "data_array":
         return composite_dbz 
     
-    # Add to dataset
-    ds = ds.copy()
-    ds['composite_reflectivity'] = composite_dbz
-    
-    return ds
-
-
-''' Version used for v1.02/v1.03
-def compute_composite_reflectivity(ds, vertical_dim='nVertLevels'):
-    """
-    Simplified radar reflectivity computation using rain, snow, and graupel.
-    This is often sufficient and more robust than including all hydrometeor types.
-    
-    Method
-    ------
-    Calculates radar reflectivity using the Rayleigh scattering approximation
-    with power-law relationships between hydrometeor mixing ratios and 
-    reflectivity factor:
-    
-        Z = a × (ρ × q)^b
-    
-    where Z is reflectivity factor (mm⁶/m³), ρ is air density (kg/m³), 
-    q is mixing ratio (kg/kg), and a, b are empirical coefficients for each
-    hydrometeor type.
-    
-    References
-    ----------
-    - Smith, P. L., Myers, C. G., & Orville, H. D. (1975). Radar Reflectivity 
-      Factor Calculations in Numerical Cloud Models Using Bulk Parameterization 
-      of Precipitation. Journal of Applied Meteorology, 14(6), 1156-1165.
-      DOI: 10.1175/1520-0450(1975)014<1156:RRFCIN>2.0.CO;2
-    
-    - Coefficients derived from WRF model post-processing implementations
-      and mesoscale modeling diagnostic packages (e.g., Stoelinga 2005,
-      WRF Post-Processing System).
-    
-    Parameters
-    ----------
-    ds : xarray.Dataset
-        Dataset containing qr, qs, qg (mixing ratios in kg/kg), 
-        pressure (Pa), and temperature (K)
-    vertical_dim : str, optional
-        Name of the vertical dimension (default: 'nVertLevels')
-    
-    Returns
-    -------
-    ds : xarray.Dataset
-        Dataset with added 'composite_reflectivity' variable in dBZ
-    
-    Notes
-    -----
-    - Uses simplified three-hydrometeor approach (rain, snow, graupel)
-    - Applies column maximum to produce composite reflectivity
-    - Minimum reflectivity threshold of 1e-3 mm⁶/m³ applied before dBZ conversion
-    """
-    # Gas constant for dry air
-    R_d = 287.0
-    
-    # Calculate air density
-    rho = ds['pressure'] / (R_d * ds['temperature'])
-    
-    # Reflectivity coefficients
-    a_rain = 3.63e9
-    b_rain = 1.75
-    a_snow = 2.02e10
-    b_snow = 2.0
-    a_graupel = 4.33e8
-    b_graupel = 1.66
-    
-    # Calculate contributions
-    Z_total = (a_rain * (rho * ds['qr']) ** b_rain + 
-               a_snow * (rho * ds['qs']) ** b_snow + 
-               a_graupel * (rho * ds['qg']) ** b_graupel)
-    
-    # Avoid log(0)
-    Z_total = Z_total.where(Z_total >= 1e-3, 1e-3)
-    
-    # Convert to dBZ
-    dbz_3d = 10 * np.log10(Z_total)
-    
-    # Composite (column maximum)
-    composite_dbz = dbz_3d.max(dim=vertical_dim)
-    
-    # Add to dataset
-    ds['composite_reflectivity'] = composite_dbz
-    ds['composite_reflectivity'].attrs = {
-        'long_name': 'Composite Radar Reflectivity',
-        'units': 'dBZ',
-        'description': 'Column-maximum radar reflectivity from rain, snow, and graupel',
-    }
-    
-    return ds
-
-'''
+    return ds.assign(comp_refl=composite_dbz)
+        
 
 def parse_order_file(order_filename : str):
     """
