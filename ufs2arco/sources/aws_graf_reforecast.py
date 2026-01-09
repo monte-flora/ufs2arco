@@ -91,12 +91,6 @@ class AWSGRAFArchive(Source):
     #BUCKET = "s3://twc-nvidia/graf/recompress/"
     GRAF_CASES_FILE = f"/data3/mflora/graf-ai/grafai/data/graf_reforecast_cases_{label}.csv"
     
-    # JSON and parquet file containing the expected times 
-    # and missing times for the old time shuffled bucket 
-    expected_times_path = "/data3/mflora/graf-ai/grafai/data/expected_graf_reforecast_times.json"
-    missing_times_path = "/data3/mflora/graf-ai/grafai/data/missing_graf_reforecast_times.parquet"
-    missing_indices_path = "/data3/mflora/graf-ai/grafai/data/missing_indices_graf_reforecast.json"
-    
     # When initializing this class, ensure that the variables
     # in sample_dims are class attributes (self.init_time=, self.forecast_step).
     # uf2arco.datamover.DataMover uses those attributes to determine sample indices,
@@ -205,15 +199,6 @@ class AWSGRAFArchive(Source):
         self.file_freqstr = file_freqstr
         self.permutation_path_dir = permutation_path_dir  
         
-        self.expected_times_per_init = None 
-        self.missing_times_per_init = None
-        if "twc-graf-reforecast" in self.BUCKET:
-            # These files contain the expected times 
-            # and missing times in the time shuffled AWS bucket. 
-            self.expected_times_per_init = load_times_dict_json(self.expected_times_path)
-            self.missing_times_per_init = load_missing_times_parquet(self.missing_times_path)
-            self.missing_indices_per_init = load_missing_indices_json(self.missing_indices_path)
-
         # This file contains the init time, forecast duration, 
         # and the case str. The init time is the index and 
         # can be indexed with a time range.
@@ -508,41 +493,39 @@ class AWSGRAFArchive(Source):
         )
         
         # time_indices are the permuted order as the data is stored.
-        # time_to_perm maps logical timestamps to permuted indices.
+        # ordered_times are the logical timeline (sorted by time).
         cache_key = (init_time, self.file_freqstr)
         cache_entry = self._perm_index_cache.get(cache_key)
         if cache_entry is None:
-            ordered_times, time_indices, unordered_times = parse_order_file(perm_file)
-            time_to_perm = {pd.Timestamp(t): i for i, t in enumerate(unordered_times)}
+            ordered_times, time_indices, _ = parse_order_file(perm_file)
             cache_entry = {
                 "time_indices": time_indices,
                 "reference_idx": time_indices[0] if time_indices else 0,
-                "time_to_perm": time_to_perm,
                 "ordered_times": ordered_times,
             }
             self._perm_index_cache[cache_key] = cache_entry
 
         time_indices = cache_entry["time_indices"]
         reference_idx = cache_entry["reference_idx"]
-        time_to_perm = cache_entry["time_to_perm"]
+        ordered_times = cache_entry["ordered_times"]
 
         valid_time = pd.Timestamp(self.get_valid_time(xds, init_time, forecast_step))
         
-        print(forecast_step, reference_idx, time_to_perm, valid_time)
+        def logical_to_perm_index(timestamp: pd.Timestamp) -> Optional[int]:
+            logical_idx = ordered_times.get_indexer([timestamp])[0]
+            if logical_idx == -1:
+                return None
+            if logical_idx >= len(time_indices):
+                return None
+            return time_indices[logical_idx]
         
         if self.file_freqstr == "15m":
-            # Is this forecast step missing? 
-            if forecast_step in self.missing_indices_per_init[f"{init_time}_{self.file_freqstr}"]:
+            perm_step = logical_to_perm_index(valid_time)
+            if perm_step is None:
                 xds = xds.isel(time=[reference_idx])
                 xds = self.get_nan_xds(xds)
-                return xds 
-            else:
-                perm_step = time_to_perm.get(valid_time)
-                if perm_step is None:
-                    xds = xds.isel(time=[reference_idx])
-                    xds = self.get_nan_xds(xds)
-                    return xds
-                xds = xds.isel(time=[perm_step])
+                return xds
+            xds = xds.isel(time=[perm_step])
         else:
             # Map the 3 logical 5-min timestamps to permuted indices.
             # We accumulate over valid_time-10, valid_time-5, valid_time.
@@ -553,11 +536,11 @@ class AWSGRAFArchive(Source):
                 valid_time,
             ]
             
-            print(expected_times) 
+            ###print(expected_times) 
             
             perm_rng = []
             for t in expected_times:
-                perm_idx = time_to_perm.get(pd.Timestamp(t))
+                perm_idx = logical_to_perm_index(pd.Timestamp(t))
                 if perm_idx is None:
                     # No tolerance for missing timesteps, 
                     # if its missing return NaNs. 
