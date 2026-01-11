@@ -90,7 +90,7 @@ class AWSGRAFArchive(Source):
     label = BUCKET.replace("//", "").replace(":", "-").replace("/", "")
     
     #BUCKET = "s3://twc-nvidia/graf/recompress/"
-    GRAF_CASES_FILE = f"/data3/mflora/graf-ai/grafai/data/graf_reforecast_cases_{label}.csv"
+    GRAF_CASES_FILE = f"/home/mflora/graf-ai/grafai/data/graf_reforecast_cases_{label}.csv"
     
     # When initializing this class, ensure that the variables
     # in sample_dims are class attributes (self.init_time=, self.forecast_step).
