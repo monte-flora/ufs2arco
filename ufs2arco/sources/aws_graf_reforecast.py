@@ -27,8 +27,9 @@ from .graf_utils import (parse_order_file,
                     times_with_nans, 
                     spherical_to_lat_lon,
                     subsample_by_month,
-                    compute_composite_reflectivity,
                     compute_geopotential,
+                    compute_composite_reflectivity,     
+                    compute_density, 
                     load_times_dict_json,
                     load_missing_times_parquet,
                     load_missing_indices_json     
@@ -62,7 +63,7 @@ class AWSGRAFArchive(Source):
         "swdnb01h", "swdnbdn", "swdnbdn01h", "t2m", "temperature", "theta",
         "tpi", "tslb", "u10", "uReconstructMeridional", "uReconstructZonal",
         "v10", "visibility", "w", "windgust10m", "comp_refl",
-        "geopot",
+        "geopot", "rho", 
         
         # 05min variables
         "apcp_bucket", "conv_bucket",
@@ -429,13 +430,16 @@ class AWSGRAFArchive(Source):
         """
         if 'comp_refl' in variables_to_add and 'comp_refl' not in xds.data_vars:
             # ['pressure', 'temperature', 'qs', 'qr', 'qg', 'qv']
-            xds = compute_composite_reflectivity(xds, vertical_dim=vertical_dim)
+            xds = compute_composite_reflectivity(xds,vertical_dim=vertical_dim)
     
         if 'geopot' in variables_to_add and 'geopot' not in xds.data_vars:
             #['pressure', 'temperature', 'qv', 'surface_elevation', 'mslp', 't2m']
             target_dims = ('time', 'cell', 'level') 
             xds = compute_geopotential(xds)
             xds['geopot'] = xds['geopot'].transpose(*target_dims)
+            
+        if 'rho' in variables_to_add and 'rho' not in xds.data_vars: 
+            xds = compute_density(xds)
     
         return xds
     
@@ -640,6 +644,8 @@ class AWSGRAFArchive(Source):
             required_vars.update(['pressure', 'temperature', 'qv', 'qs', 'qr', 'qg', 'mslp'])
         if 'geopot' in self.variables:
             required_vars.update(['pressure', 'temperature', 'qv', 'mslp', 't2m'])
+        if 'rho' in self.variables:
+            required_vars.update(['pressure', 'temperature', 'qv'])
 
         vars_to_keep = [v for v in required_vars if v in xds.data_vars]
         xds = xds[vars_to_keep]
