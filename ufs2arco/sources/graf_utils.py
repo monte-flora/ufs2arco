@@ -1,10 +1,48 @@
 from typing import Tuple
 
 from datetime import datetime 
+import importlib
 import pandas as pd 
 import numpy as np
 import xarray as xr
 import json 
+
+def compute_density(ds, return_as="dataset"):
+    """
+    Dask-compatible (lazy) moist air density computation.
+    
+    Physics:
+    Uses the Ideal Gas Law adjusted for moisture (Virtual Temperature).
+    rho = P / (Rd * Tv)
+    """
+    # 1. Constants
+    Rd = 287.05
+    
+    # 2. Lazy Variable Extraction (Force float64 for calculation precision)
+    # We assume standard variable names often found in WRF/MPAS outputs
+    p = ds["pressure"].astype(np.float64)
+    t = ds["temperature"].astype(np.float64)
+    qv = ds["qv"].astype(np.float64)
+
+    # 3. Virtual Temperature (Lazy Element-wise)
+    # Moist air is lighter than dry air. Tv accounts for this buoyancy effect.
+    # Tv = T * (1 + 0.608 * qv)
+    tv = t * (1.0 + 0.608 * qv)
+
+    # 4. Density Calculation (Equation of State)
+    # rho = P / (Rd * Tv)
+    rho_da = p / (Rd * tv)
+
+    # 5. Metadata
+    rho_da.name = "density"
+    rho_da.attrs["units"] = "kg m-3"
+    rho_da.attrs["long_name"] = "Moist Air Density"
+    
+    if return_as == "data_array":
+        return rho_da
+    
+    return ds.assign(rho=rho_da.astype(np.float32))
+    
 
 def compute_geopotential(ds, z_dim="level", surface_elev_var="surface_elevation", return_as="dataset"):
     """
@@ -107,8 +145,54 @@ def compute_geopotential(ds, z_dim="level", surface_elev_var="surface_elevation"
 
 def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"):
     """
-    Computes Composite Reflectivity with a 'Bright Band' heuristic.
-    Boosts snow/graupel reflectivity in the melting layer (0C to 5C).
+    Compute composite (column-maximum) radar reflectivity with convective hail enhancement.
+    
+    Calculates reflectivity from mixing ratios (rain, snow, graupel) using Z-M relationships
+    tuned for severe convection. Includes temperature-dependent dielectric adjustments to 
+    simulate radar bright band (melting snow) and wet hail enhancement effects.
+    
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Input dataset containing:
+        - 'pressure' : Air pressure (Pa)
+        - 'temperature' : Air temperature (K)
+        - 'qr' : Rain mixing ratio (kg/kg)
+        - 'qs' : Snow mixing ratio (kg/kg)
+        - 'qg' : Graupel/hail mixing ratio (kg/kg)
+    vertical_dim : str, default='level'
+        Name of the vertical coordinate dimension to maximize over
+    return_as : str, default='dataset'
+        Return format (currently unused, returns DataArray)
+    
+    Returns
+    -------
+    xarray.DataArray
+        Composite reflectivity in dBZ, clipped to [-10, 80] dBZ range.
+        Shape matches input with `vertical_dim` removed.
+    
+    Notes
+    -----
+    Key enhancements over simple Z-M relationships:
+    
+    1. **Graupel Coefficient Boost** (a_graupel = 2.5e10):
+       Increased from soft-graupel value to represent hard hail, adding ~8-10 dBZ
+       to convective cores.
+    
+    2. **Wet Hail Enhancement**:
+       Graupel above 0°C receives full dielectric factor (|K|² = 1.0) to simulate
+       wet hail's increased radar cross-section, regardless of temperature.
+    
+    3. **Bright Band Simulation**:
+       Snow between 0-5°C (273-278 K) receives enhanced dielectric factor to 
+       represent the melting layer radar signature.
+    
+    Assumes ideal gas law for air density: ρ = p/(R_d·T)
+    
+    Examples
+    --------
+    >>> comp_refl = compute_composite_reflectivity(model_ds)
+    >>> comp_refl.plot()
     """
     min_comp_refl_val = 0.0
     R_d = 287.05
@@ -123,64 +207,65 @@ def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"
     # Density
     rho = p / (R_d * t)
 
-    # --- 1. Coefficients (Standard) ---
-    # Rain
-    a_rain = 3.63e9
+    # --- 1. Coefficients (Tuned for Convection) ---
+    
+    # Rain: Boosted slightly for heavy convection
+    # Old: 3.63e9. New: 4.0e9 (Small bump)
+    a_rain = 4.0e9 
     b_rain = 1.75
     
-    # Snow/Graupel (Intrinsic coefficients)
+    # Snow: Standard Bright Band logic is fine here
     a_snow = 2.02e10
     b_snow = 2.0
     
-    # Treating graupel more like hail
-    a_graupel = 3.8e9 #4.33e8
-    b_graupel = 1.75 #1.66
+    # Graupel/Hail: SIGNIFICANT BOOST
+    # Old: 3.8e9 (Soft Graupel) -> New: 2.5e10 (Hard Hail)
+    # This change alone adds ~8-10 dBZ to graupel cores
+    a_graupel = 2.5e10 
+    b_graupel = 1.75 
     
-    # --- 2. Dynamic Dielectric Factor (The Bright Band Logic) ---
+    # --- 2. Dynamic Dielectric Factor ---
     
-    # Base factor for Dry Ice (Frozen)
-    # |K|^2_ice / |K|^2_water ~= 0.176 / 0.93 ~= 0.19
-    dielectric_dry = 0.19
+    dielectric_dry = 0.19 # Frozen
+    dielectric_wet = 1.0  # Liquid/Melting
     
-    # Factor for Wet Ice (Melting)
-    # Melting snow surfaces scatter like water.
-    dielectric_wet = 1.0 
+    # A. Logic for SNOW (The Bright Band)
+    # Snow melts quickly. We only want the boost in the transition zone (0C to 5C).
+    # Above 5C, snow converts to rain (qr), so qs drops to near zero anyway.
+    is_snow_melting = (t >= 273.15) & (t <= 278.15)
     
-    # Define Melting Zone: 273.15K (0C) to 278.15K (+5C)
-    # We create a mask where snow is melting.
-    # Note: We assume snow exists in this layer (handled by 'qs' term later).
-    is_melting = (t >= 273.15) & (t <= 278.15)
-    
-    # Create a spatially varying factor map
-    # If melting: use 1.0 (Wet). If frozen: use 0.19 (Dry).
-    dielectric_factor = xr.where(
-        is_melting,
+    dielectric_factor_snow = xr.where(
+        is_snow_melting,
         dielectric_wet,
         dielectric_dry
     )
 
+    # B. Logic for GRAUPEL/HAIL (The "Wet Hail" Effect)
+    # Hail survives into warm air. If T > 0C, the surface is wet.
+    # We DO NOT restrict this to < 5C. If it's 30C, hail is definitely wet!
+    is_graupel_wet = (t >= 273.15)
+    
+    dielectric_factor_graupel = xr.where(
+        is_graupel_wet,
+        dielectric_wet, # 1.0 (Wet surface scatters like crazy)
+        dielectric_dry  # 0.19 (Dry ice aloft)
+    )
+
     # --- 3. Compute Z for each species ---
     
-    # Rain (Always liquid, factor = 1.0 implicit in coefficients)
     Z_rain = a_rain * (rho * qr)**b_rain
     
-    # Snow (Apply dynamic dielectric factor)
-    # In the melting layer, this term jumps up by ~5x (approx 7 dB)
-    Z_snow = (a_snow * (rho * qs)**b_snow) * dielectric_factor
+    # Snow uses the band logic
+    Z_snow = (a_snow * (rho * qs)**b_snow) * dielectric_factor_snow
     
-    # Graupel (Apply dynamic dielectric factor)
-    Z_graupel = (a_graupel * (rho * qg)**b_graupel) * dielectric_factor
+    # Graupel uses the "Always Wet if Warm" logic
+    Z_graupel = (a_graupel * (rho * qg)**b_graupel) * dielectric_factor_graupel
 
     # --- 4. Total and Convert ---
     
     Z_total = Z_rain + Z_snow + Z_graupel
     
-    # Floor for log safety (-10 dBZ)
     Z_min_threshold = 0.1 
-    
-    # We clip Z_total inside the log function. 
-    # This prevents log10(0) from ever happening.
-    # The 'where' logic ensures we still effectively apply the threshold.
     Z_safe = Z_total.clip(min=Z_min_threshold)
     
     dbz_3d = xr.where(
@@ -189,19 +274,17 @@ def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"
         min_comp_refl_val
     )
     
-    # Composite
     composite_dbz = dbz_3d.max(dim=vertical_dim)
     
-    # Clip unreasonable values 
+    # Clip max to reasonable hail limit (e.g., 75-80 dBZ)
     composite_dbz = composite_dbz.clip(min=-10, max=80)
     
     composite_dbz.name = 'comp_refl'
     composite_dbz.attrs = {
         'units': 'dBZ', 
-        'description': 'Column-maximum radar reflectivity from rain, snow, and graupel',
-        'note': 'Includes heuristic bright-band enhancement in melting layer (0-5C)'
+        'description': 'Composite Reflectivity with Hail Enhancement'
     }
-    
+
     composite_dbz = composite_dbz.astype(np.float32)
     
     if return_as == "data_array":
