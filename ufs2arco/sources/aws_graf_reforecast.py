@@ -30,6 +30,7 @@ from .graf_utils import (parse_order_file,
                     compute_geopotential,
                     compute_composite_reflectivity,     
                     compute_density, 
+                    compute_virtual_pot_temp,    
                     load_times_dict_json,
                     load_missing_times_parquet,
                     load_missing_indices_json     
@@ -63,7 +64,7 @@ class AWSGRAFArchive(Source):
         "swdnb01h", "swdnbdn", "swdnbdn01h", "t2m", "temperature", "theta",
         "tpi", "tslb", "u10", "uReconstructMeridional", "uReconstructZonal",
         "v10", "visibility", "w", "windgust10m", "comp_refl",
-        "geopot", "rho", 
+        "geopot", "rho", "theta_m",
         
         # 05min variables
         "apcp_bucket", "conv_bucket",
@@ -90,7 +91,7 @@ class AWSGRAFArchive(Source):
     label = BUCKET.replace("//", "").replace(":", "-").replace("/", "")
     
     #BUCKET = "s3://twc-nvidia/graf/recompress/"
-    GRAF_CASES_FILE = f"/data3/mflora/graf-ai/grafai/data/graf_reforecast_cases_{label}.csv"
+    GRAF_CASES_FILE = f"/home/mflora/graf-ai/grafai/data/graf_reforecast_cases_{label}.csv"
     
     # When initializing this class, ensure that the variables
     # in sample_dims are class attributes (self.init_time=, self.forecast_step).
@@ -440,6 +441,9 @@ class AWSGRAFArchive(Source):
             
         if 'rho' in variables_to_add and 'rho' not in xds.data_vars: 
             xds = compute_density(xds)
+            
+        if 'theta_m' in variables_to_add and 'theta_m' not in xds.data_vars: 
+            xds = compute_virtual_pot_temp(xds)
     
         return xds
     
@@ -646,6 +650,8 @@ class AWSGRAFArchive(Source):
             required_vars.update(['pressure', 'temperature', 'qv', 'mslp', 't2m'])
         if 'rho' in self.variables:
             required_vars.update(['pressure', 'temperature', 'qv'])
+        if 'theta_m' in self.variables:
+            required_vars.update(['theta', 'qv'])
 
         vars_to_keep = [v for v in required_vars if v in xds.data_vars]
         xds = xds[vars_to_keep]
