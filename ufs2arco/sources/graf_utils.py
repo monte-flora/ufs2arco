@@ -7,6 +7,23 @@ import numpy as np
 import xarray as xr
 import json 
 
+def compute_virtual_pot_temp(ds, return_as="dataset"):
+    theta = ds['theta']
+    qv = ds['qv']
+    
+    theta_m = theta * (1.0 + 0.608 * qv)
+    
+    # 5. Metadata
+    theta_m.name = "theta_m"
+    theta_m.attrs["units"] = "K"
+    theta_m.attrs["long_name"] = "Virtual Potential Temperature"
+    
+    if return_as == "data_array":
+        return theta_m
+    
+    return ds.assign(theta_m=theta_m.astype(np.float32))
+
+
 def compute_density(ds, return_as="dataset"):
     """
     Dask-compatible (lazy) moist air density computation.
