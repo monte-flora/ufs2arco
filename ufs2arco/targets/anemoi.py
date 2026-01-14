@@ -628,10 +628,11 @@ class Anemoi(Target):
     def reconcile_missing_and_nans(self) -> None:
         """This has to happen after :meth:`add_dates` is called.
 
-        Here we do two things:
+        Here we do three things:
             1. Make sure missing_dates show up as True in the ``has_nans_array``
                (which propagates to ``has_nans``, since :meth:`aggregate_stats: is called right after this.)
             2. If we have NaNs that we should not have, report it as a missing date
+            3. Update missing_indices to match missing_dates for correct forecast data handling
         """
 
         logger.info(f"{self.name}.reconcile_missing_and_nans: Starting...")
@@ -641,7 +642,12 @@ class Anemoi(Target):
         xds = xds.swap_dims({"time": "dates"})
         xds["has_nans_array"].load()
         missing_dates = xds.attrs.get("missing_dates", [])
+        missing_indices = set(xds.attrs.get("missing_indices", []))
         attrs = xds.attrs.copy()
+
+        # Build a mapping from date to time indices for updating missing_indices
+        dates_array = xds["dates"].values
+        time_indices = xds["time"].values
 
         nds = xr.Dataset()
         nds["has_nans_array"] = xds["has_nans_array"]
@@ -649,14 +655,22 @@ class Anemoi(Target):
         # 1. Make sure has_nans_array is True at missing_dates
         logger.info("Checking that has_nans_array = True at each missing_date")
         for mdate in missing_dates:
-            this_one = xds.sel(dates=mdate)
-            is_actually_nan = np.isnan(this_one["data"]).any().values
-            has_nan = this_one["has_nans_array"].any().values
-            if is_actually_nan and not has_nan:
-                something_happened = True
+            try:
+                this_one = xds.sel(dates=mdate)
+                is_actually_nan = np.isnan(this_one["data"]).any().values
+                has_nan = this_one["has_nans_array"].any().values
+                if is_actually_nan and not has_nan:
+                    something_happened = True
+                    logger.info(f" ... setting the date in has_nans_array to True: {mdate}")
+                    nds["has_nans_array"].loc[{"dates": mdate}] = True
 
-                logger.info(f" ... setting the date in has_nans_array to True: {mdate}")
-                nds["has_nans_array"].loc[{"dates": mdate}] = True
+                # Also ensure index is in missing_indices
+                time_idx = int(this_one["time"].values)
+                if time_idx not in missing_indices:
+                    missing_indices.add(time_idx)
+                    something_happened = True
+            except KeyError:
+                logger.warning(f" ... missing_date {mdate} not found in dates array, skipping")
 
 
         # 2. Make sure dates with unexpected NaNs get added to missing_dates
@@ -679,25 +693,33 @@ class Anemoi(Target):
         keep_idx = [idx for idx in xds["variable"].values if idx not in ignore_idx]
 
         nanidx = xds["has_nans_array"].sel(variable=keep_idx).any(["variable", "ensemble"]).values
+        nan_time_indices = np.where(nanidx)[0]
         nandates = [str(pd.Timestamp(ndate)) for ndate in xds["dates"][nanidx].values]
         new_missing_dates = list()
-        for ndate in nandates:
+        for i, ndate in enumerate(nandates):
             is_missing = ndate in missing_dates
             if not is_missing:
                 something_happened = True
                 logger.info(f" ... adding date where has_nans_array = True to missing_dates: {ndate}")
                 new_missing_dates.append(ndate)
 
+            # Also add to missing_indices
+            time_idx = int(nan_time_indices[i])
+            if time_idx not in missing_indices:
+                missing_indices.add(time_idx)
+
         if len(new_missing_dates) > 0:
             attrs["missing_dates"] = sorted(missing_dates + new_missing_dates)
 
+        # 3. Update missing_indices in attrs
+        attrs["missing_indices"] = sorted(missing_indices)
 
         if something_happened:
             nds["time"] = xds["time"]
             nds = nds.swap_dims({"dates": "time"}).drop_vars("dates")
             nds.attrs = attrs
             nds.to_zarr(self.store_path, mode="a")
-            logger.info(f"{self.name}.reconcile_missing_and_nans: Updated zarr with missing_dates and has_nans_array")
+            logger.info(f"{self.name}.reconcile_missing_and_nans: Updated zarr with {len(attrs.get('missing_indices', []))} missing_indices")
 
 
     def aggregate_stats(self, topo) -> None:
@@ -869,35 +891,75 @@ class Anemoi(Target):
 
 
     def handle_missing_data(self, missing_data: list[dict]) -> None:
-        """Take a list of dicts, with dimensions of missing data. Keep track of any missing dates
-        (via "t0" or "time") and store that in the zarr.
-
-        Note that anemoi doesn't really care if we have 30 ensemble members that are good to go for a missing date,
-        if one is missing they all are.
+        """Track missing data by storing both missing_dates (for backward compatibility)
+        and missing_indices (for correct handling of forecast data with duplicate valid times).
 
         Note: it is assumed this is only called from the root process
 
         Args:
-            missing_data (list[dict]): list with missing data dicts
+            missing_data (list[dict]): list with missing data dicts, containing sample dimensions
+                For forecast data: {"init_time": "...", "forecast_step": N}
+                For analysis data: {"time": "..."}
         """
-
         missing_dates = []
+        missing_indices = []
         zds = zarr.open(self.store_path, mode="a")
 
+        # Get source properties for computing indices
+        has_trajectory_info = (
+            hasattr(self.source, 'trajectory_id_dict') and
+            hasattr(self.source, 'n_steps') and
+            hasattr(self.source, 'forecast_offset')
+        )
+
         for missing_sample in missing_data:
+            # Compute valid_time for missing_dates (backward compatibility)
             if self._has_fhr:
                 valid_time = pd.Timestamp(missing_sample["t0"]) + pd.Timedelta(hours=missing_sample["fhr"])
-                valid_time = str(valid_time)
+                valid_time_str = str(valid_time)
+            elif "init_time" in missing_sample and "forecast_step" in missing_sample:
+                # GRAF-style forecast data
+                init_time = missing_sample["init_time"]
+                forecast_step = missing_sample["forecast_step"]
+                # Compute valid_time from init_time and forecast_step
+                if hasattr(self.source, 'get_valid_time'):
+                    valid_time = self.source.get_valid_time(None, init_time, forecast_step)
+                    valid_time_str = str(valid_time)
+                else:
+                    valid_time_str = f"{init_time}_step{forecast_step}"
             else:
-                valid_time = missing_sample["time"]
+                valid_time_str = str(missing_sample.get("time", "unknown"))
 
-            # in multisource case, we could have repeats
-            if valid_time not in missing_dates:
-                missing_dates.append(valid_time)
+            # Add to missing_dates for backward compatibility
+            if valid_time_str not in missing_dates:
+                missing_dates.append(valid_time_str)
 
+            # Compute exact index for missing_indices
+            if "init_time" in missing_sample and "forecast_step" in missing_sample and has_trajectory_info:
+                # GRAF-style: compute index from trajectory_id and forecast_step
+                init_time = missing_sample["init_time"]
+                forecast_step = missing_sample["forecast_step"]
+                traj_id = self.source.trajectory_id_dict.get(init_time)
+                if traj_id is not None:
+                    # Index = trajectory_start + step_within_trajectory
+                    idx = traj_id * self.source.n_steps + (forecast_step - self.source.forecast_offset)
+                    if idx not in missing_indices:
+                        missing_indices.append(idx)
+            elif "time" in missing_sample:
+                # Analysis data: find index by matching time in dates array
+                dates_array = zds["dates"][:]
+                target_time = np.datetime64(missing_sample["time"], "s")
+                matching = np.where(dates_array == target_time)[0]
+                for idx in matching:
+                    if int(idx) not in missing_indices:
+                        missing_indices.append(int(idx))
 
+        # Store both for compatibility
         zds.attrs["missing_dates"] = missing_dates
+        zds.attrs["missing_indices"] = sorted(missing_indices)
         zarr.consolidate_metadata(self.store_path)
+
+        logger.info(f"Stored {len(missing_dates)} missing_dates and {len(missing_indices)} missing_indices")
 
 
     def merge_multisource(self, dslist: list[xr.Dataset]) -> xr.Dataset:

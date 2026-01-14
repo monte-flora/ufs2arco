@@ -487,10 +487,13 @@ class AWSGRAFArchive(Source):
         perm_file: str,
         init_time: str,
         forecast_step: int,
-    ) -> xr.Dataset:
+    ) -> Optional[xr.Dataset]:
         """
         Select a forecast timestep knowing the time order is shuffled.
         For the 5-min dataset, select a range of timesteps.
+
+        Returns:
+            xr.Dataset if timestep exists, None if timestep is missing.
         """
         # Raise a deprecation warning about the time reordering.
         logger.warning(
@@ -499,7 +502,7 @@ class AWSGRAFArchive(Source):
                 " Update workflow once new data is available"
             )
         )
-        
+
         # time_indices are the permuted order as the data is stored.
         # ordered_times are the logical timeline (sorted by time).
         cache_key = (init_time, self.file_freqstr)
@@ -514,11 +517,10 @@ class AWSGRAFArchive(Source):
             self._perm_index_cache[cache_key] = cache_entry
 
         time_indices = cache_entry["time_indices"]
-        reference_idx = cache_entry["reference_idx"]
         ordered_times = cache_entry["ordered_times"]
 
         valid_time = pd.Timestamp(self.get_valid_time(xds, init_time, forecast_step))
-        
+
         def logical_to_perm_index(timestamp: pd.Timestamp) -> Optional[int]:
             logical_idx = ordered_times.get_indexer([timestamp])[0]
             if logical_idx == -1:
@@ -526,13 +528,12 @@ class AWSGRAFArchive(Source):
             if logical_idx >= len(time_indices):
                 return None
             return time_indices[logical_idx]
-        
+
         if self.file_freqstr == "15m":
             perm_step = logical_to_perm_index(valid_time)
             if perm_step is None:
-                xds = xds.isel(time=[reference_idx])
-                xds = self.get_nan_xds(xds)
-                return xds
+                logger.warning(f"Missing timestep: init_time={init_time}, forecast_step={forecast_step}, valid_time={valid_time}")
+                return None  # Return None to signal missing timestep
             xds = xds.isel(time=[perm_step])
         else:
             # Map the 3 logical 5-min timestamps to permuted indices.
@@ -543,22 +544,18 @@ class AWSGRAFArchive(Source):
                 valid_time - 1 * freq_5m,
                 valid_time,
             ]
-            
-            ###print(expected_times) 
-            
+
             perm_rng = []
             for t in expected_times:
                 perm_idx = logical_to_perm_index(pd.Timestamp(t))
                 if perm_idx is None:
-                    # No tolerance for missing timesteps, 
-                    # if its missing return NaNs. 
-                    xds = xds.isel(time=[reference_idx])
-                    xds = self.get_nan_xds(xds)
-                    return xds
+                    # No tolerance for missing timesteps
+                    logger.warning(f"Missing 5min timestep: init_time={init_time}, t={t}")
+                    return None  # Return None to signal missing timestep
                 perm_rng.append(perm_idx)
 
             xds = xds.isel(time=perm_rng)
-              
+
         return xds 
 
     def maybe_soil_impute_over_ocean(self, xds: xr.Dataset) -> xr.Dataset:
@@ -660,15 +657,19 @@ class AWSGRAFArchive(Source):
         return xds
 
     def open_sample_dataset(
-        self, 
-        dims : dict, 
-        open_static_vars: bool, 
+        self,
+        dims : dict,
+        open_static_vars: bool,
         cache_dir : Optional[str] = None,
     )-> xr.Dataset:
-        """Lazily open a GRAF reforecast zarr file and process a single forecast time step""" 
+        """Lazily open a GRAF reforecast zarr file and process a single forecast time step.
+
+        Returns:
+            xr.Dataset with data if timestep exists, empty xr.Dataset() if timestep is missing.
+        """
         step = dims["forecast_step"]
         init_time = dims['init_time']
-             
+
         if init_time in self._base_xds_cache_per_init_time:
             xds = self._base_xds_cache_per_init_time[init_time]
             perm_file = self._perm_file_cache_per_init_time[init_time]
@@ -676,12 +677,15 @@ class AWSGRAFArchive(Source):
             xds, perm_file = self._open_zarr(dims)
             xds = self._prepare_base_xds(xds)
             self._base_xds_cache_per_init_time[init_time] = xds
-            self._perm_file_cache_per_init_time[init_time] = perm_file 
-            
-        valid_time = self.get_valid_time(xds,  **dims)   
-        
+            self._perm_file_cache_per_init_time[init_time] = perm_file
+
+        valid_time = self.get_valid_time(xds,  **dims)
+
         if "twc-graf-reforecast" in self.BUCKET:
             xds = self.select_time_with_perm(xds, perm_file, **dims)
+            # Check if timestep was missing
+            if xds is None:
+                return xr.Dataset()  # Return empty dataset to signal missing data
         else:
             xds = self.select_time(xds, step)
         
