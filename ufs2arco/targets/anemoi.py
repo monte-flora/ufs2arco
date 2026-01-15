@@ -665,10 +665,19 @@ class Anemoi(Target):
                     nds["has_nans_array"].loc[{"dates": mdate}] = True
 
                 # Also ensure index is in missing_indices
-                time_idx = int(this_one["time"].values)
-                if time_idx not in missing_indices:
-                    missing_indices.add(time_idx)
-                    something_happened = True
+                # Handle both scalar and array cases (duplicate dates)
+                time_vals = this_one["time"].values
+                if time_vals.ndim == 0:
+                    # Scalar (0-d array)
+                    time_indices_to_add = [int(time_vals.item())]
+                else:
+                    # Array - multiple time indices for this date
+                    time_indices_to_add = [int(t) for t in time_vals]
+
+                for time_idx in time_indices_to_add:
+                    if time_idx not in missing_indices:
+                        missing_indices.add(time_idx)
+                        something_happened = True
             except KeyError:
                 logger.warning(f" ... missing_date {mdate} not found in dates array, skipping")
 
