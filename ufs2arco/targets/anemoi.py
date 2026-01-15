@@ -832,7 +832,7 @@ class Anemoi(Target):
         n_time = len(diffs["time"])
 
         # Split time indices across ranks
-        time_indices = np.array_split(np.arange(n_time - 1), topo.size)
+        time_indices = np.array_split(np.arange(n_time), topo.size)
         local_indices = time_indices[topo.rank]
 
         # Allocate global accumulators
@@ -914,11 +914,15 @@ class Anemoi(Target):
 
         for missing_sample in missing_data:
             # Compute valid_time for missing_dates (backward compatibility)
-            if self._has_fhr:
+            # Prefer using valid_time if already provided (avoids redundant computation)
+            if "valid_time" in missing_sample:
+                # Use propagated valid_time from source
+                valid_time_str = str(missing_sample["valid_time"])
+            elif self._has_fhr:
                 valid_time = pd.Timestamp(missing_sample["t0"]) + pd.Timedelta(hours=missing_sample["fhr"])
                 valid_time_str = str(valid_time)
             elif "init_time" in missing_sample and "forecast_step" in missing_sample:
-                # GRAF-style forecast data
+                # GRAF-style forecast data - fallback to computation
                 init_time = missing_sample["init_time"]
                 forecast_step = missing_sample["forecast_step"]
                 # Compute valid_time from init_time and forecast_step
@@ -967,7 +971,7 @@ class Anemoi(Target):
 
         attrs_list = [xds.attrs.copy() for xds in dslist]
 
-        result = xr.concat(dslist, dim="variable", combine_attrs="drop")
+        result = xr.concat(dslist, dim="variable", combine_attrs="drop", data_vars="all")
 
         # these should not have a variable dimension
         for key in ["latitudes", "longitudes"]:

@@ -302,7 +302,11 @@ class Driver:
                 # we couldn't find the file, keep track of it
                 batch_indices = self.mover.get_batch_indices(batch_idx)
                 for these_dims in batch_indices:
-                    missing_dims.append(these_dims)
+                    # Enrich with valid_time if available in dataset attrs
+                    these_dims_enriched = these_dims.copy()
+                    if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
+                        these_dims_enriched['valid_time'] = xds.attrs['valid_time']
+                    missing_dims.append(these_dims_enriched)
 
             logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
 
@@ -343,7 +347,11 @@ class Driver:
 
                 batch_indices = self.mover.get_batch_indices(batch_idx)
                 for these_dims in batch_indices:
-                    missing_again.append(these_dims)
+                    # Enrich with valid_time if available (consistent with run())
+                    these_dims_enriched = these_dims.copy()
+                    if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
+                        these_dims_enriched['valid_time'] = xds.attrs['valid_time']
+                    missing_again.append(these_dims_enriched)
 
             logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
 
@@ -374,6 +382,9 @@ class Driver:
 
     def get_missing_data_path(self, store_path) -> str:
         directory, zstore = os.path.split(store_path)
+        # Handle relative paths (directory could be empty string)
+        if not directory:
+            directory = "."
         return f"{directory}/missing.{zstore}.yaml"
 
     def report_missing_data(self, missing_dims):
@@ -405,17 +416,28 @@ class Driver:
 
 # some utilities for handling missing data
 def _get_time(d):
-    return d.get("t0", d.get("time", None))
+    """Get time value for sorting missing data entries.
+
+    Prioritizes valid_time (actual forecast valid time) for sorting, which is
+    more intuitive for forecast datasets. Falls back to other time formats:
+    - "t0": forecast initialization time
+    - "time": analysis/reanalysis time
+    - "init_time": GRAF-style forecast initialization
+
+    Returns empty string if no time key found (sortable default).
+    """
+    return d.get("valid_time", d.get("t0", d.get("time", d.get("init_time", ""))))
 
 def _convert_types_to_yaml(d):
     d = d.copy()
     # Convert pd.Timestamp to string
-    if "t0" in d and isinstance(d["t0"], pd.Timestamp):
-        d["t0"] = str(d["t0"])
-    if "time" in d and isinstance(d["time"], pd.Timestamp):
-        d["time"] = str(d["time"])
+    for key in ["t0", "time", "init_time", "valid_time"]:
+        if key in d:
+            if isinstance(d[key], pd.Timestamp):
+                d[key] = str(d[key])
+            # valid_time may already be a string from source attrs - keep as-is
     # Convert numpy integers to Python int
-    for key in ["fhr", "member"]:
+    for key in ["fhr", "member", "forecast_step"]:
         if key in d and isinstance(d[key], np.integer):
             d[key] = int(d[key])
     return d
@@ -426,8 +448,7 @@ def _open_patch_yaml(yamlpath):
         missing_dims = yaml.safe_load(f)
     # Convert string -> pd.Timestamp
     for i, d in enumerate(missing_dims):
-        if "t0" in d and isinstance(d["t0"], str):
-            missing_dims[i]["t0"] = pd.Timestamp(d["t0"])
-        if "time" in d and isinstance(d["time"], str):
-            missing_dims[i]["time"] = pd.Timestamp(d["time"])
+        for key in ["t0", "time", "init_time", "valid_time"]:
+            if key in d and isinstance(d[key], str):
+                missing_dims[i][key] = pd.Timestamp(d[key])
     return missing_dims

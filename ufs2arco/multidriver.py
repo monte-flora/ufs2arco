@@ -237,7 +237,11 @@ class MultiDriver(Driver):
                     foundit.append(False)
                     batch_indices = mover.get_batch_indices(batch_idx)
                     for these_dims in batch_indices:
-                        missing_dims.append(these_dims)
+                        # Enrich with valid_time if available in dataset attrs
+                        these_dims_enriched = these_dims.copy()
+                        if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
+                            these_dims_enriched['valid_time'] = xds.attrs['valid_time']
+                        missing_dims.append(these_dims_enriched)
 
             # we need both conditionals, since all([]) == True
             if all(foundit) and len(foundit) == len(self.movers):

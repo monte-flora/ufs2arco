@@ -685,7 +685,12 @@ class AWSGRAFArchive(Source):
             xds = self.select_time_with_perm(xds, perm_file, **dims)
             # Check if timestep was missing
             if xds is None:
-                return xr.Dataset()  # Return empty dataset to signal missing data
+                # Return empty dataset with metadata for missing data tracking
+                empty_ds = xr.Dataset()
+                empty_ds.attrs['init_time'] = dims['init_time']
+                empty_ds.attrs['forecast_step'] = dims['forecast_step']
+                empty_ds.attrs['valid_time'] = str(valid_time)
+                return empty_ds
         else:
             xds = self.select_time(xds, step)
         
