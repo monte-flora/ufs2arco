@@ -701,6 +701,11 @@ class Anemoi(Target):
 
         keep_idx = [idx for idx in xds["variable"].values if idx not in ignore_idx]
 
+        # Handle edge case where all variables are in variables_with_nans
+        if len(keep_idx) == 0:
+            logger.warning("All variables are in variables_with_nans - falling back to checking ALL variables for NaN detection")
+            keep_idx = list(xds["variable"].values)
+
         nanidx = xds["has_nans_array"].sel(variable=keep_idx).any(["variable", "ensemble"]).values
         nan_time_indices = np.where(nanidx)[0]
         nandates = [str(pd.Timestamp(ndate)) for ndate in xds["dates"][nanidx].values]
@@ -716,6 +721,23 @@ class Anemoi(Target):
             time_idx = int(nan_time_indices[i])
             if time_idx not in missing_indices:
                 missing_indices.add(time_idx)
+
+        # 2b. Check for timesteps where ALL data is NaN using count_array
+        # This provides a more robust check than has_nans_array alone
+        if "count_array" in xds:
+            logger.info("Checking count_array for timesteps with all NaN/zero data (count=0)")
+            total_count_per_time = xds["count_array"].sel(variable=keep_idx).sum(["variable", "ensemble"]).values
+            all_nan_time_indices = np.where(total_count_per_time == 0)[0]
+
+            for time_idx in all_nan_time_indices:
+                time_idx = int(time_idx)
+                if time_idx not in missing_indices:
+                    date_str = str(pd.Timestamp(xds["dates"].isel(dates=time_idx).values))
+                    logger.warning(f" ... timestep {time_idx} ({date_str}) has ALL NaN/zero data (count=0)")
+                    missing_indices.add(time_idx)
+                    if date_str not in missing_dates and date_str not in new_missing_dates:
+                        new_missing_dates.append(date_str)
+                    something_happened = True
 
         if len(new_missing_dates) > 0:
             attrs["missing_dates"] = sorted(missing_dates + new_missing_dates)

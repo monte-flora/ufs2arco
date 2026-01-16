@@ -6,6 +6,7 @@ import traceback
 
 from math import ceil
 
+import numpy as np
 import xarray as xr
 import dask.array
 
@@ -211,14 +212,17 @@ class DataMover():
                 nds = nds.assign_coords({key: xds[key].copy()})
         nds = self.target.manage_coords(nds)
 
-        # create empty data arrays
+        # create empty data arrays initialized with NaN
+        # Using NaN instead of zeros ensures unwritten data is detectable
+        # during reconcile_missing_and_nans, since np.isnan(zeros) = False
         for varname in xds.data_vars:
             dims = xds[varname].dims
             shape = tuple(len(nds[key]) for key in dims)
             chunks = {list(dims).index(key): self.target.chunks[key] for key in dims}
             nds[varname] = xr.DataArray(
-                data=dask.array.zeros(
+                data=dask.array.full(
                     shape=shape,
+                    fill_value=np.nan,
                     chunks=chunks,
                     dtype=xds[varname].dtype,
                 ),
