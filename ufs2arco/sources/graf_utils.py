@@ -224,63 +224,84 @@ def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"
     # Density
     rho = p / (R_d * t)
 
-    # --- 1. Coefficients (Tuned for Convection) ---
-    
-    # Rain: Boosted slightly for heavy convection
-    # Old: 3.63e9. New: 4.0e9 (Small bump)
-    a_rain = 4.0e9 
-    b_rain = 1.75
-    
-    # Snow: Standard Bright Band logic is fine here
-    a_snow = 2.02e10
+    # --- 1. Coefficients ---
+
+    # Rain: higher exponent (b=2.0) makes the Z-M response more nonlinear.
+    # Light qr (moderate precip) contributes far less → cuts false alarms and
+    # areal over-coverage; heavy qr (intense cores) changes by only ~2-3 dBZ.
+    # This better approximates how Morrison 2-moment varies N0r with intensity.
+    a_rain = 3.0e9
+    b_rain = 2.0
+
+    # Snow: reduced from original 2.02e10; diagnostics showed snow was the
+    # dominant bias driver (column-max mean ~8 dBZ, p90 ~33 dBZ).
+    # Morrison 2-moment variable N0s gives less Z per unit qs than fixed-N0.
+    a_snow = 1.0e10
     b_snow = 2.0
-    
-    # Graupel/Hail: SIGNIFICANT BOOST
-    # Old: 3.8e9 (Soft Graupel) -> New: 2.5e10 (Hard Hail)
-    # This change alone adds ~8-10 dBZ to graupel cores
-    a_graupel = 2.5e10 
-    b_graupel = 1.75 
-    
+
+    # Graupel (base): moderate coefficient, steep exponent.
+    # b=2.0 concentrates signal in heavy-graupel cores vs. light rimed particles.
+    a_graupel = 8.0e9
+    b_graupel = 2.0
+
     # --- 2. Dynamic Dielectric Factor ---
-    
-    dielectric_dry = 0.19 # Frozen
-    dielectric_wet = 1.0  # Liquid/Melting
-    
+
+    dielectric_dry = 0.19           # dry ice / frozen particles
+    dielectric_wet_snow = 1.0       # melting snow bright band (full liquid coat)
+    dielectric_wet_graupel = 0.7    # thin water film on graupel (partial wet coat)
+
     # A. Logic for SNOW (The Bright Band)
-    # Snow melts quickly. We only want the boost in the transition zone (0C to 5C).
-    # Above 5C, snow converts to rain (qr), so qs drops to near zero anyway.
+    # Boost limited to the 0-5 °C melting layer; above 5 °C, qs ≈ 0 anyway.
     is_snow_melting = (t >= 273.15) & (t <= 278.15)
-    
+
     dielectric_factor_snow = xr.where(
         is_snow_melting,
-        dielectric_wet,
+        dielectric_wet_snow,
         dielectric_dry
     )
 
-    # B. Logic for GRAUPEL/HAIL (The "Wet Hail" Effect)
-    # Hail survives into warm air. If T > 0C, the surface is wet.
-    # We DO NOT restrict this to < 5C. If it's 30C, hail is definitely wet!
+    # B. Logic for GRAUPEL (wet-coat effect above 0 °C)
     is_graupel_wet = (t >= 273.15)
-    
+
     dielectric_factor_graupel = xr.where(
         is_graupel_wet,
-        dielectric_wet, # 1.0 (Wet surface scatters like crazy)
-        dielectric_dry  # 0.19 (Dry ice aloft)
+        dielectric_wet_graupel,
+        dielectric_dry
     )
 
     # --- 3. Compute Z for each species ---
-    
-    Z_rain = a_rain * (rho * qr)**b_rain
-    
-    # Snow uses the band logic
-    Z_snow = (a_snow * (rho * qs)**b_snow) * dielectric_factor_snow
-    
-    # Graupel uses the "Always Wet if Warm" logic
+
+    Z_rain    = a_rain    * (rho * qr)**b_rain
+    Z_snow    = (a_snow   * (rho * qs)**b_snow)    * dielectric_factor_snow
     Z_graupel = (a_graupel * (rho * qg)**b_graupel) * dielectric_factor_graupel
 
+    # --- 3b. Hail Proxy (qg-only substitute for missing QHAIL) ---
+    # Diagnostics show that large QGRAUPEL (> ~0.5 g/kg) occurs at COLD levels
+    # in active updraft cores — NOT in warm air — so the proxy must NOT be
+    # restricted to T > 0 °C.  Large rimed particles at any level scatter
+    # intensely; this term specifically targets the high-reflectivity cores
+    # that would otherwise be captured by a dedicated QHAIL field.
+    # The same temperature-dependent dielectric already modulates the wet/dry
+    # factor appropriately (dry aloft, partial wet coat near melting layer).
+    qg_hail_threshold = 0.5e-3      # 0.5 g/kg  (p99.9 of 3D qg field ≈ 0.2 g/kg;
+                                    # 0.5 g/kg selects the most intense cores)
+    a_hail_proxy      = 2.0e10      # hard-rimed / proto-hail coefficient
+    b_hail_proxy      = 1.75        # standard exponent for dense particles
+
+    Z_hail_proxy = xr.where(
+        qg >= qg_hail_threshold,
+        # Do NOT multiply by dielectric_factor_graupel here: a_hail_proxy is a
+        # hard-rimed-particle coefficient that already embeds the appropriate
+        # scattering cross-section for dense ice.  Applying 0.19 (dry-ice
+        # dielectric) on top would cut the signal by 5× at cold levels, which
+        # is physically incorrect for large, dense graupel.
+        a_hail_proxy * (rho * qg)**b_hail_proxy,
+        0.0
+    )
+
     # --- 4. Total and Convert ---
-    
-    Z_total = Z_rain + Z_snow + Z_graupel
+
+    Z_total = Z_rain + Z_snow + Z_graupel + Z_hail_proxy
     
     Z_min_threshold = 0.1 
     Z_safe = Z_total.clip(min=Z_min_threshold)
