@@ -5,6 +5,7 @@ import xarray as xr
 from ufs2arco.transforms.horizontal_regrid import horizontal_regrid
 from ufs2arco.transforms.mappings import get_available_mappings, apply_mappings
 from ufs2arco.transforms.rotate_vectors import rotate_vectors
+from ufs2arco.transforms.unstructured_regrid import unstructured_regrid
 from ufs2arco.transforms.vertical_regrid import fv_vertical_regrid
 from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
 
@@ -19,6 +20,7 @@ class Transformer:
             "divide",
             "fv_vertical_regrid",
             "horizontal_regrid",
+            "unstructured_regrid",
             "mappings",
             "rotate_vectors",
             "temporal_aggregation",
@@ -48,8 +50,8 @@ class Transformer:
             if len(unrecognized) > 0:
                 raise NotImplementedError(f"Transformer.__init__: the following mappings are not recognized or not implemented: {unrecognized}")
 
-        # if we want to do horizontal regridding, check if xesmf is installed
-        if "horizontal_regrid" in names:
+        # if we want to do horizontal or unstructured regridding, check if xesmf is installed
+        if "horizontal_regrid" in names or "unstructured_regrid" in names:
             try:
                 import xesmf
             except ImportError:
@@ -92,6 +94,9 @@ class Transformer:
 
         if "horizontal_regrid" in self.names:
             xds = horizontal_regrid(xds, **self.options["horizontal_regrid"])
+
+        if "unstructured_regrid" in self.names:
+            xds = unstructured_regrid(xds, **self.options["unstructured_regrid"])
 
         if "mappings" in self.names:
             xds = apply_mappings(xds, self.options["mappings"])

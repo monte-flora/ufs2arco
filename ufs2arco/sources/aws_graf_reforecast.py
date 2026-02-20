@@ -40,7 +40,7 @@ from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
 
 # Required to load the new compressed bucket
 import sys, os
-sys.path.append("/data3/mflora/graf-ai/")
+sys.path.append("/home/mflora/graf-ai/")
 from grafai.utils import scale_codec
 
 logger = logging.getLogger("ufs2arco")
@@ -72,7 +72,12 @@ class AWSGRAFArchive(Source):
         "zrain_bucket",
         
         # static variables
-        'surface_elevation', 'land_sea_mask', 'climo_soiltemp', 'latitude', 'longitude'
+        'surface_elevation', 'land_sea_mask', 'climo_soiltemp', 
+        'subgrid_terrain_variance', 'terrain_convexity', 
+        'orographic_asymmetry_we', 'orographic_asymmetry_sn', 
+        'orographic_asymmetry_swne', 'orographic_asymmetry_nwse',
+        
+        'latitude', 'longitude'
     )
     
     available_levels = list(range(50))
@@ -113,7 +118,13 @@ class AWSGRAFArchive(Source):
     STATIC_VAR_RENAMER = {
         'ter' : 'surface_elevation', 
         'landmask' : 'land_sea_mask', 
-        'soiltemp' : 'climo_soiltemp'
+        'soiltemp' : 'climo_soiltemp',
+        'var2d' : 'subgrid_terrain_variance',
+        'con' : 'terrain_convexity',
+        'oa1' : 'orographic_asymmetry_we',
+        'oa2' : 'orographic_asymmetry_sn',
+        'oa3' : 'orographic_asymmetry_swne',
+        'oa4' : 'orographic_asymmetry_nwse',
     } 
     
     WIND_VAR_RENAMER = {
@@ -208,7 +219,11 @@ class AWSGRAFArchive(Source):
                       index_col = "init_time",
                       parse_dates=["init_time"]
                      )
-        graf_cases_df_sub = graf_cases_df.loc[init_times['start']:init_times['stop']]
+        if "dates" in init_times:
+            target_dates = pd.to_datetime(init_times["dates"])
+            graf_cases_df_sub = graf_cases_df.loc[target_dates]
+        else:
+            graf_cases_df_sub = graf_cases_df.loc[init_times['start']:init_times['stop']]
         self.init_times_df = subsample_by_month(graf_cases_df_sub, **subsample_by_month_kwargs)
 
         # Returns the directory names in the AWS bucket
