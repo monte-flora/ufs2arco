@@ -1,11 +1,123 @@
 from typing import Tuple
 
-from datetime import datetime 
+from datetime import datetime
 import importlib
-import pandas as pd 
+import pandas as pd
 import numpy as np
 import xarray as xr
-import json 
+import json
+from scipy.linalg import solve_banded
+
+
+def raymond_filter_1d(f, eps=0.5):
+    """Apply one pass of the Raymond (1988) 2nd-order implicit tangent filter."""
+    n = len(f)
+    ab = np.zeros((3, n))
+    ab[0, 1:] = -eps
+    ab[1, :] = 1.0 + 2.0 * eps
+    ab[2, :-1] = -eps
+    return solve_banded((1, 1), ab, f)
+
+
+def raymond_filter_2d(field_2d, eps=0.5, order=6):
+    """Apply Raymond (1988) implicit tangent low-pass filter in both directions.
+
+    Parameters
+    ----------
+    field_2d : np.ndarray, shape (ny, nx)
+    eps : float
+        Filter strength. 0.5 = moderate, 1.0 = aggressive.
+    order : int
+        Filter order (2, 4, or 6). Achieved by repeated application of 2nd order.
+        Higher order = sharper spectral cutoff.
+    """
+    n_passes = order // 2
+    result = field_2d.astype(np.float64)
+    for _ in range(n_passes):
+        for i in range(result.shape[0]):
+            result[i, :] = raymond_filter_1d(result[i, :], eps)
+        for j in range(result.shape[1]):
+            result[:, j] = raymond_filter_1d(result[:, j], eps)
+    return result.astype(np.float32)
+
+
+def apply_raymond_filter_to_dataset(xds, eps=0.5, order=6, level_dim='level'):
+    """Apply Raymond filter to all 3D variables in an xarray Dataset.
+
+    Filters each 2D (y, x) slice at each vertical level independently.
+    Skips 2D-only variables (no level dimension) and coordinate variables.
+
+    Parameters
+    ----------
+    xds : xr.Dataset
+        Dataset with dims including 'y', 'x', and optionally level_dim.
+    eps : float
+        Raymond filter strength.
+    order : int
+        Filter order (2, 4, or 6).
+    level_dim : str
+        Name of the vertical level dimension.
+
+    Returns
+    -------
+    xr.Dataset with filtered data variables.
+    """
+    # Variables to skip (static, coordinate-like, or 2D)
+    skip_vars = {'latitude', 'longitude', 'surface_elevation', 'land_sea_mask'}
+
+    updates = {}
+    for var_name in xds.data_vars:
+        if var_name in skip_vars:
+            continue
+
+        da = xds[var_name]
+        dims = da.dims
+
+        if 'y' not in dims or 'x' not in dims:
+            continue
+
+        vals = da.values.copy()
+
+        # Squeeze any size-1 time dimension for filtering, then restore
+        had_time = 'time' in dims
+        if had_time:
+            time_axis = dims.index('time')
+            vals = vals.squeeze(axis=time_axis)
+            squeezed_dims = tuple(d for d in dims if d != 'time')
+        else:
+            squeezed_dims = dims
+
+        if level_dim in squeezed_dims:
+            level_axis = squeezed_dims.index(level_dim)
+            n_levels = vals.shape[level_axis]
+            for k in range(n_levels):
+                if level_axis == 0:
+                    slc = vals[k, :, :]
+                elif level_axis == 1:
+                    slc = vals[:, k, :]
+                else:
+                    slc = vals[:, :, k]
+
+                if not np.isnan(slc).any():
+                    filtered = raymond_filter_2d(slc, eps=eps, order=order)
+                    if level_axis == 0:
+                        vals[k, :, :] = filtered
+                    elif level_axis == 1:
+                        vals[:, k, :] = filtered
+                    else:
+                        vals[:, :, k] = filtered
+        else:
+            if not np.isnan(vals).any():
+                vals = raymond_filter_2d(vals, eps=eps, order=order)
+
+        # Restore time dimension if it was squeezed
+        if had_time:
+            vals = np.expand_dims(vals, axis=time_axis)
+
+        updates[var_name] = (da.dims, vals)
+
+    return xds.assign({k: v for k, v in updates.items()})
+
 
 def compute_virtual_pot_temp(ds, return_as="dataset"):
     theta = ds['theta']
@@ -329,7 +441,76 @@ def compute_composite_reflectivity(ds, vertical_dim='level', return_as="dataset"
         return composite_dbz 
     
     return ds.assign(comp_refl=composite_dbz)
-        
+
+
+def compute_reflectivity_3d(ds, vertical_dim='level', return_as="dataset"):
+    """Compute 3D radar reflectivity (dBZ) at each model level.
+
+    Same physics as compute_composite_reflectivity but retains the vertical
+    dimension instead of taking the column max. Provides the model with
+    vertical structure information: brightband, updraft cores, echo tops.
+
+    Returns a 3D field with the same dimensions as the input 3D variables.
+    """
+    R_d = 287.05
+    min_refl_val = 0.0
+
+    p = ds['pressure']
+    t = ds['temperature']
+    qr = ds['qr']
+    qs = ds['qs']
+    qg = ds['qg']
+
+    rho = p / (R_d * t)
+
+    # Coefficients (identical to compute_composite_reflectivity)
+    a_rain, b_rain = 3.0e9, 2.0
+    a_snow, b_snow = 1.0e10, 2.0
+    a_graupel, b_graupel = 8.0e9, 2.0
+
+    dielectric_dry = 0.19
+    dielectric_wet_snow = 1.0
+    dielectric_wet_graupel = 0.7
+
+    dielectric_factor_snow = xr.where(
+        (t >= 273.15) & (t <= 278.15), dielectric_wet_snow, dielectric_dry
+    )
+    dielectric_factor_graupel = xr.where(
+        t >= 273.15, dielectric_wet_graupel, dielectric_dry
+    )
+
+    Z_rain = a_rain * (rho * qr)**b_rain
+    Z_snow = (a_snow * (rho * qs)**b_snow) * dielectric_factor_snow
+    Z_graupel = (a_graupel * (rho * qg)**b_graupel) * dielectric_factor_graupel
+
+    # Hail proxy
+    qg_hail_threshold = 0.5e-3
+    a_hail_proxy, b_hail_proxy = 2.0e10, 1.75
+    Z_hail_proxy = xr.where(
+        qg >= qg_hail_threshold,
+        a_hail_proxy * (rho * qg)**b_hail_proxy,
+        0.0
+    )
+
+    Z_total = Z_rain + Z_snow + Z_graupel + Z_hail_proxy
+    Z_min_threshold = 0.1
+    Z_safe = Z_total.clip(min=Z_min_threshold)
+
+    dbz_3d = xr.where(
+        Z_total > Z_min_threshold,
+        10.0 * np.log10(Z_safe),
+        min_refl_val
+    )
+
+    dbz_3d = dbz_3d.clip(min=-10, max=80).astype(np.float32)
+    dbz_3d.name = 'refl_3d'
+    dbz_3d.attrs = {'units': 'dBZ', 'description': '3D Radar Reflectivity'}
+
+    if return_as == "data_array":
+        return dbz_3d
+
+    return ds.assign(refl_3d=dbz_3d)
+
 
 def parse_order_file(order_filename : str):
     """

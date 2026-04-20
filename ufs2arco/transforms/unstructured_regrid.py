@@ -19,7 +19,6 @@ import logging
 
 import numpy as np
 import xarray as xr
-import xesmf
 
 logger = logging.getLogger("ufs2arco")
 
@@ -87,6 +86,7 @@ def unstructured_regrid(
     xds = xds.rename({"cell": "points"})
 
     # ── 5. Create regridder with pre-computed weights ─────────────────
+    import xesmf
     regridder = xesmf.Regridder(
         grid_src,
         grid_tgt,

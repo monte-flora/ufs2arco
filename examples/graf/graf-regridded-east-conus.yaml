@@ -1,0 +1,114 @@
+mover:
+    name: mpidatamover
+
+directories:
+    zarr: /path/to/output/graf_regridded_east_conus.zarr
+    cache: /path/to/cache/ufs2arco-cache/
+    logs: /path/to/logs/ufs2arco-logs/training
+
+common_extent: &extent
+    lat_min: 25.0       # Southern CONUS
+    lat_max: 50.0       # Northern CONUS
+    lon_min: 255.0      # ~-105°W (east of Rockies)
+    lon_max: 300.0      # ~-60°W (east coast + buffer)
+
+multisource:
+
+    # 15-min GRAF regridded data
+    - source:
+        name: aws_graf_regridded_archive
+        file_freqstr: 15m
+        init_times:
+            start: "2004-01-01"
+            stop: "2024-12-31"
+        lead_times:
+            start: 6h
+            stop: 24h
+        geographic_extent: *extent
+        static_regridded_file_path: /path/to/GRAF_CONUS_static_regridded.nc
+        variables:
+            - uReconstructMeridional
+            - uReconstructZonal
+            - w
+            - theta
+            - pressure
+            - qv
+            - temperature
+            - t2m
+            - u10
+            - v10
+            - dewpoint_2m
+            - mslp
+            - skintemp
+            - hpbl
+            - cape
+            - cin
+            - precipw
+            - swdnb
+            - swdnb01h
+        static_variables:
+            - ter
+            - landmask
+        levels:
+            - 0
+            - 2
+            - 4
+            - 5
+            - 6
+            - 7
+            - 8
+            - 10
+            - 12
+            - 14
+            - 16
+            - 18
+            - 20
+            - 22
+            - 24
+            - 26
+            - 28
+        destagger_kwargs:
+            vars_to_destag:
+                w: nVertLevelsP1
+            unstag_dim_names:
+                nVertLevelsP1: level
+
+    # 5-min GRAF regridded data (precipitation)
+    - source:
+        name: aws_graf_regridded_archive
+        file_freqstr: 05m
+        init_times:
+            start: "2004-01-01"
+            stop: "2024-12-31"
+        lead_times:
+            start: 6h
+            stop: 24h
+        geographic_extent: *extent
+        static_regridded_file_path: /path/to/GRAF_CONUS_static_regridded.nc
+        variables:
+            - apcp_bucket
+        temporal_aggregation_kwargs:
+            reduce_map:
+                sum:
+                    - apcp_bucket
+
+target:
+    name: anemoi
+    do_flatten_grid: True
+    sort_channels_by_levels: True
+    compute_temporal_residual_statistics: True
+    forcings:
+        - cos_latitude
+        - sin_latitude
+        - cos_longitude
+        - sin_longitude
+        - cos_julian_day
+        - sin_julian_day
+        - cos_local_time
+        - sin_local_time
+        - insolation
+    chunks:
+        time: 1
+        variable: -1
+        ensemble: 1
+        cell: -1

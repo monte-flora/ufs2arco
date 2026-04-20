@@ -239,9 +239,16 @@ class Anemoi(Target):
         xds = xds.reset_coords()
         xds = xds[sorted(xds.data_vars)]
         
-        # Add the latitude and longitude back in 
-        xds['latitudes'] = lat_da.isel(ensemble=0)
-        xds['longitudes'] = lon_da.isel(ensemble=0) 
+        # Add the latitude and longitude back in
+        # If grid was flattened from 2D (y, x) → cell, flatten lat/lon to match
+        lat_1d = lat_da.isel(ensemble=0)
+        lon_1d = lon_da.isel(ensemble=0)
+        if self.do_flatten_grid and len(lat_1d.dims) > 1:
+            stack_order = xds.attrs.get("stack_order", list(lat_1d.dims))
+            lat_1d = lat_1d.stack(cell=stack_order).reset_index("cell", drop=True)
+            lon_1d = lon_1d.stack(cell=stack_order).reset_index("cell", drop=True)
+        xds['latitudes'] = lat_1d
+        xds['longitudes'] = lon_1d
         
         # Monte: hardcoding the variable dim rechunking.
         xds = xds.chunk({"variable" : -1})
@@ -310,9 +317,14 @@ class Anemoi(Target):
         Returns:
             xds (xr.Dataset): with new time dimension "time" ("dates" is still there)
         """
-        # Monte: since "time" is a dummy variable for the forecast data, 
-        # we want to use "valid_time" here. 
-        t = [list(self.datetime).index(date) for date in xds["valid_time"]]
+        # Monte: since "time" is a dummy variable for the forecast data,
+        # we want to use "valid_time" here.
+        # Use _sample_index if available (handles non-unique valid_times,
+        # e.g. WoFSCast ensemble members sharing the same valid_time).
+        if "_sample_index" in xds.attrs:
+            t = [xds.attrs["_sample_index"]]
+        else:
+            t = [list(self.datetime).index(date) for date in xds["valid_time"]]
         
         xds["time"] = xr.DataArray(
             t,
