@@ -13,6 +13,7 @@ _recognized = {
     "aws_aorc": "AWSAORC",
     "aws_graf_archive": "AWSGRAFArchive",
     "aws_graf_regridded_archive": "AWSGRAFRegriddedArchive",
+    "aws_graf_regridded_patches": "AWSGRAFRegriddedPatchesArchive",
     "wofscast_archive": "WoFSCastArchive",
 }
 
@@ -28,6 +29,7 @@ _lazy_imports = {
     "GFSArchive": ".gfs_archive",
     "AWSGRAFArchive": ".aws_graf_reforecast",
     "AWSGRAFRegriddedArchive": ".aws_graf_reforecast_regridded",
+    "AWSGRAFRegriddedPatchesArchive": ".aws_graf_regridded_patches",
     "WoFSCastArchive": ".wofscast",
 }
 
