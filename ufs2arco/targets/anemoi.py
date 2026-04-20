@@ -160,6 +160,7 @@ class Anemoi(Target):
         forcings: Optional[tuple | list] = None,
         statistics_period: Optional[dict] = None,
         compute_temporal_residual_statistics: Optional[bool] = False,
+        compute_spectral_gradient_statistics: Optional[bool] = False,
         sort_channels_by_levels: Optional[bool] = False,
         variables_with_nans: Optional[list] = None,
         do_flatten_grid : bool = False
@@ -174,6 +175,16 @@ class Anemoi(Target):
             statistics_period=statistics_period,
             compute_temporal_residual_statistics=compute_temporal_residual_statistics,
         )
+        # Opt-in flag (not in the base Target schema — guarded in the run loop
+        # via hasattr). Requires compute_temporal_residual_statistics=True too.
+        self.compute_spectral_gradient_statistics = bool(compute_spectral_gradient_statistics)
+        if self.compute_spectral_gradient_statistics and not self.compute_temporal_residual_statistics:
+            raise ValueError(
+                f"{self.name}.__init__: compute_spectral_gradient_statistics=True "
+                f"requires compute_temporal_residual_statistics=True "
+                f"(spectral stats are computed in residual space using the "
+                f"tendency-stdev written by calc_temporal_residual_stats)."
+            )
 
         self.sort_channels_by_levels = sort_channels_by_levels
         # additional checks
@@ -591,6 +602,11 @@ class Anemoi(Target):
             logger.info(f"Computing temporal residual statistics")
             self.calc_temporal_residual_stats(topo)
             logger.info(f"Done computing temporal residual statistics\n")
+
+        if getattr(self, "compute_spectral_gradient_statistics", False):
+            logger.info(f"Computing spectral + gradient statistics")
+            self.calc_spectral_gradient_stats(topo)
+            logger.info(f"Done computing spectral + gradient statistics\n")
     
     def add_trajectory_ids(self)->None:
         """
@@ -929,6 +945,169 @@ class Anemoi(Target):
             logger.info(f"{self.name}.calc_temporal_residual_stats: Stored temporal residual stats")
 
         # unclear if this barrier is necessary
+        topo.barrier()
+
+
+    def calc_spectral_gradient_stats(self, topo):
+        """Per-variable spectral + gradient stats in both physical and residual space.
+
+        Writes six 1-D arrays (shape ``(variable,)``) to the zarr root:
+
+            * statistics_msh_beta                         (physical)
+            * statistics_gradient_x_stdev                 (physical)
+            * statistics_gradient_y_stdev                 (physical)
+            * statistics_tendencies_<freq>_msh_beta       (residual)
+            * statistics_tendencies_<freq>_gradient_x_stdev
+            * statistics_tendencies_<freq>_gradient_y_stdev
+
+        β_j ≡ 1 / ⟨AMSE_j⟩ where AMSE is computed between zero-pred and the
+        physical (or residual-normalized) tendency over the 2-D patch. FastNet
+        γ_k = max(N_k·k^√3, 1) wavenumber weighting is applied.
+
+        σ_∂{x,y} ≡ sqrt(⟨(∂target)²⟩) over the 2-D patch pixels and all time
+        pairs in the statistics_period (same time range as calc_temporal_residual_stats).
+
+        Residual space uses ``statistics_tendencies_<freq>_stdev`` as the per-variable
+        divisor (matches what anemoi.models.preprocessing.residual_normalizer.ResidualNormalizer
+        does at training time). Depends on calc_temporal_residual_stats having
+        already run — raises a clear error otherwise.
+
+        Uses the same MPI split across ``topo.size`` ranks as
+        ``calc_temporal_residual_stats``. Cross-trajectory diffs (NaN) are skipped.
+        """
+        from ufs2arco.targets.spectral_utils import (
+            accumulate_frame,
+            build_accumulators,
+            build_radial_bins,
+            finalize_stats,
+            gamma_k_weights,
+        )
+
+        xds = xr.open_zarr(self.store_path)
+        attrs = xds.attrs.copy()
+        freqstr = xds.attrs["frequency"]
+
+        # Need the tendency stdev written by calc_temporal_residual_stats.
+        tend_stdev_name = f"statistics_tendencies_{freqstr}_stdev"
+        if tend_stdev_name not in xds:
+            raise RuntimeError(
+                f"{self.name}.calc_spectral_gradient_stats: {tend_stdev_name!r} "
+                f"not found in zarr — run calc_temporal_residual_stats() first."
+            )
+
+        # 2-D grid shape for FFT + stencil. field_shape is set by the target
+        # during grid flattening (do_flatten_grid=True path).
+        field_shape = xds.attrs.get("field_shape")
+        if field_shape is None or len(field_shape) != 2:
+            raise RuntimeError(
+                f"{self.name}.calc_spectral_gradient_stats: field_shape attr missing or "
+                f"not 2-D ({field_shape!r}). Spectral stats require a regular grid."
+            )
+        H, W = int(field_shape[0]), int(field_shape[1])
+        if H * W != xds.sizes["cell"]:
+            raise RuntimeError(
+                f"{self.name}.calc_spectral_gradient_stats: field_shape {field_shape} "
+                f"doesn't match cell dim {xds.sizes['cell']}."
+            )
+
+        # Residual-normalizer clamp — matches ResidualNormalizer's internal floor
+        tend_stdev = xds[tend_stdev_name].values.astype(np.float64)
+        tend_stdev_safe = np.maximum(tend_stdev, 1.0e-6)
+        V = tend_stdev.shape[0]
+
+        # Restrict to statistics_period (same window as tendency stats)
+        start_idx = list(self.datetime).index(pd.Timestamp(self.statistics_start_date))
+        end_idx = list(self.datetime).index(pd.Timestamp(self.statistics_end_date))
+        xds = xds.sel(time=slice(start_idx, end_idx))
+
+        # Tendency field with trajectory-boundary masking (NaN at boundaries)
+        diffs = xds["data"].diff("time")
+        same_traj = xds["trajectory_ids"] == xds["trajectory_ids"].shift(time=1)
+        diffs = diffs.where(same_traj)
+        n_time = len(diffs["time"])
+
+        # Split time indices across ranks
+        time_indices = np.array_split(np.arange(n_time), topo.size)
+        local_indices = time_indices[topo.rank]
+
+        # Precompute radial bins + γ_k (constant across frames)
+        bin_idx, weight, n_bins = build_radial_bins(H, W)
+        bin_idx_flat = bin_idx.flatten()
+        weight_flat = weight.flatten()
+        gamma_k = gamma_k_weights(n_bins)
+
+        accumulators = build_accumulators(V)
+
+        logger.info(
+            f"{self.name}.calc_spectral_gradient_stats: rank {topo.rank}/{topo.size} "
+            f"processing {len(local_indices)} / {n_time} frames (H=%d W=%d V=%d)",
+            H, W, V,
+        )
+        n_all_nan = 0
+        n_frames_any_valid = 0
+        for i_local, t in enumerate(local_indices):
+            # (V, ensemble, cell) → drop ens, reshape → (V, H, W)
+            frame = diffs.isel(time=int(t)).values.astype(np.float64)
+            if frame.ndim == 3:
+                frame = frame[:, 0, :]  # collapse ensemble dim (E=1 for GRAF)
+            tendency_phys = frame.reshape(V, H, W)
+            # accumulate_frame applies per-variable NaN masking — returns
+            # 0 if the whole frame is invalid (cross-trajectory boundary,
+            # missing timestep, etc.).
+            n_valid = accumulate_frame(
+                tendency_phys, tend_stdev_safe,
+                bin_idx_flat, weight_flat, gamma_k, n_bins,
+                accumulators,
+            )
+            if n_valid == 0:
+                n_all_nan += 1
+            else:
+                n_frames_any_valid += 1
+            if (i_local + 1) % 500 == 0:
+                logger.info(
+                    f"{self.name}.calc_spectral_gradient_stats: rank %d   %d/%d frames "
+                    f"(%d with valid vars, %d all-NaN)",
+                    topo.rank, i_local + 1, len(local_indices),
+                    n_frames_any_valid, n_all_nan,
+                )
+
+        # --- MPI aggregation (same pattern as calc_temporal_residual_stats) ---
+        logger.info(f"{self.name}.calc_spectral_gradient_stats: rank {topo.rank} → root reduce")
+        global_accum = {k: np.zeros_like(v) for k, v in accumulators.items()}
+        for key in accumulators:
+            topo.sum(accumulators[key], global_accum[key])
+        logger.info(f"{self.name}.calc_spectral_gradient_stats: reduction done")
+
+        if topo.is_root:
+            stats = finalize_stats(global_accum)
+            nds = xr.Dataset()
+            nds.attrs = attrs
+            ckw = {"coords": xds["variable"].coords}
+
+            # Physical space (on the raw tendency field)
+            nds["statistics_msh_beta"] = xr.DataArray(stats["msh_beta_physical"], **ckw)
+            nds["statistics_gradient_x_stdev"] = xr.DataArray(stats["gradient_x_stdev_physical"], **ckw)
+            nds["statistics_gradient_y_stdev"] = xr.DataArray(stats["gradient_y_stdev_physical"], **ckw)
+
+            # Residual / tendency-normalized space (matches GraphResidualForecaster loss)
+            nds[f"statistics_tendencies_{freqstr}_msh_beta"] = xr.DataArray(
+                stats["msh_beta_residual"], **ckw)
+            nds[f"statistics_tendencies_{freqstr}_gradient_x_stdev"] = xr.DataArray(
+                stats["gradient_x_stdev_residual"], **ckw)
+            nds[f"statistics_tendencies_{freqstr}_gradient_y_stdev"] = xr.DataArray(
+                stats["gradient_y_stdev_residual"], **ckw)
+
+            nds.to_zarr(self.store_path, mode="a")
+            amse_counts = global_accum["amse_count_per_var"]
+            logger.info(
+                f"{self.name}.calc_spectral_gradient_stats: wrote 6 arrays to zarr "
+                f"(per-variable frame counts: min=%d median=%d max=%d; "
+                f"β_phys median=%.3e, β_res median=%.3e)",
+                int(amse_counts.min()), int(np.median(amse_counts)), int(amse_counts.max()),
+                float(np.median(stats["msh_beta_physical"])),
+                float(np.median(stats["msh_beta_residual"])),
+            )
+
         topo.barrier()
 
 
