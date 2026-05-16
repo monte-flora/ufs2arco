@@ -7,7 +7,10 @@ import warnings
 
 import numpy as np
 import xarray as xr
-from zarr import NestedDirectoryStore
+try:
+    from zarr import NestedDirectoryStore
+except ImportError:
+    NestedDirectoryStore = None  # removed in zarr v3; guarded at use site
 
 from datetime import datetime, timedelta
 from cftime import DatetimeJulian
