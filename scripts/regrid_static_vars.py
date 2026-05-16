@@ -12,7 +12,7 @@ Usage:
         --static-file /home/mflora/graf-ai/grafai/data/rpm4km.static.nc \
         --weight-file /home/mflora/graf-reforecast-conus-interp/data/graf_to_grafconus_4km_weights.nc \
         --reference-zarr /grafrr/2004010112_27/mpasout_15m.zarr \
-        --output /home/mflora/graf-reforecast-conus-interp/data/GRAF_CONUS_static_regridded.nc
+        --output /home/mflora/graf-ai/grafai/data/graf_regridded_static.nc
 
 Author: monte-flora
 """

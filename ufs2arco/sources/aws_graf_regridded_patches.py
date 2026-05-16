@@ -4,7 +4,7 @@ Reads the same S3 zarrs as :class:`AWSGRAFRegriddedArchive` but produces
 many short (3-frame) trajectories per case instead of one long per-init
 trajectory. Each trajectory is a 1000×1000 km spatial patch sampled from
 a manifest that was built ahead of time by
-``grafai/datasets/graf-regridded-conus-patches/scripts/build_patch_manifest.py``.
+``grafai/datasets/patch_sampler/build_patch_manifest.py``.
 
 Key differences from the parent class
 -------------------------------------
@@ -37,15 +37,20 @@ centers ahead of the main dataset build.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
+import re
 from typing import Literal, Optional
 
 import netCDF4  # noqa: F401 — parent class imports
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+# Manifests may carry replica suffixes (``<case_str>@r<n>``) so that the same
+# underlying case can contribute several instances with distinct random
+# start-offsets + patches (precip-rank upsampling). Strip before URL lookup.
+_REPLICA_SUFFIX = re.compile(r"@r\d+$")
 
 from ufs2arco.sources import Source
 from ufs2arco.sources.aws_graf_reforecast_regridded import AWSGRAFRegriddedArchive
@@ -58,20 +63,16 @@ from ufs2arco.transforms.temporal_aggregation import temporal_aggregation
 
 logger = logging.getLogger("ufs2arco")
 
-# HRRR 4 km Lambert Conformal grid pixel size (km)
+# GRAF regridded 4 km Lambert Conformal grid pixel size (km).
+# Not HRRR's LC — GRAF uses its own projection; the 4 km pixel size happens
+# to match HRRR's, so the pixel-km math is the same.
 _PIXEL_KM = 4.0
 
 
-def _trajectory_id_to_int(s: str) -> int:
-    """Deterministic 63-bit positive int from a trajectory_id string.
-
-    The manifest stores trajectory_id as a human-readable
-    "<case>:<start_offset>:<patch_idx>" string. The final zarr stores
-    trajectory_ids as int64. This maps the string → int stably so the
-    same manifest always yields the same integer IDs.
-    """
-    h = hashlib.md5(s.encode()).digest()[:8]
-    return int.from_bytes(h, "big") & 0x7FFFFFFFFFFFFFFF
+# Trajectory IDs are assigned as sequential small ints (matches the Oklahoma
+# dataset convention via np.repeat(np.arange(n_init), n_steps)). The
+# human-readable "<case>:<start_offset>:<patch_idx>" string is preserved
+# in self.trajectory_id_dict for inspection.
 
 
 class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
@@ -84,6 +85,11 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
 
     # Same sample-dim convention as the parent — DataMover iteration unchanged.
     sample_dims = ("init_time", "forecast_step")
+
+    # Each sample is a different spatial slice → static vars (ter, landmask,
+    # per-patch lat/lon) differ across samples even though their tendency
+    # within a trajectory is 0. See Source.statics_vary_per_sample docstring.
+    statics_vary_per_sample = True
 
     def __init__(
         self,
@@ -222,6 +228,15 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
     def name(self) -> str:
         return "AWSGRAFRegriddedPatchesArchive"
 
+    def _build_path(self, init_time: str) -> str:
+        """Build the zarr URL, stripping any ``@r<n>`` replica suffix.
+
+        Case replicas share the same underlying data — only the random
+        start-offsets and patch centers differ across replicas.
+        """
+        case_str = _REPLICA_SUFFIX.sub("", init_time)
+        return f"{self.BUCKET}{case_str}/mpasout_{self.file_freqstr}.zarr"
+
     # ------------------------------------------------------------------
     # Iteration: forecast_step enumerates (patch_idx × n_frames) per init
     # ------------------------------------------------------------------
@@ -241,7 +256,11 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
 
         all_valid_times: list[pd.Timestamp] = []
         all_traj_ids: list[int] = []
+        # Sequential small-int IDs (matches the Oklahoma dataset convention).
+        # Keep the human-readable string mapping for inspection / tracing back
+        # to the manifest entry.
         self.trajectory_id_dict: dict[str, int] = {}
+        next_int_id = 0
 
         for init_time in self.init_time:
             init_dt = self._init_time_dt_map[init_time]
@@ -249,7 +268,8 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
             for patch_idx_slot in range(self.n_patches_per_init):
                 entry = entries[patch_idx_slot]
                 traj_id_str: str = entry["trajectory_id"]
-                traj_id_int = _trajectory_id_to_int(traj_id_str)
+                traj_id_int = next_int_id
+                next_int_id += 1
                 self.trajectory_id_dict[traj_id_str] = traj_id_int
 
                 start_off_td = pd.Timedelta(minutes=int(entry["start_offset_min"]))
@@ -278,21 +298,28 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
         at (lat_c, lon_c) in the HRRR grid's lat/lon convention.
 
         Uses nearest-pixel matching + ``patch_size_pix / 2`` half-width.
-        Patches that span the grid edge are clipped (may be smaller than
-        nominal); the manifest builder's bbox avoids edge cases for the
-        default CONUS bbox.
+        If the nominal slice would run off the grid edge, the slice is
+        SHIFTED INWARD so the full ``(patch_size_pix, patch_size_pix)``
+        window always fits. This keeps sample shape uniform (required
+        by the downstream zarr writer) at the cost of shifting edge
+        patches by up to ``half`` pixels; the stored per-patch lat/lon
+        reflect the actual (shifted) center, so downstream consumers
+        see the real location of the data, not the manifest's intent.
         """
         lat_2d = self.lat_lon["latitude"][-1]    # (y, x)
         lon_2d = self.lat_lon["longitude"][-1]   # in 360° convention
+        H, W = lat_2d.shape
         # Convert input lon to 360° for matching
         lon_match = lon_c if lon_c >= 0 else lon_c + 360.0
         d2 = (lat_2d - lat_c) ** 2 + (lon_2d - lon_match) ** 2
         y_c, x_c = np.unravel_index(int(np.argmin(d2)), d2.shape)
         half = self.patch_size_pix // 2
-        y_lo = max(0, y_c - half)
-        y_hi = min(lat_2d.shape[0], y_c + half)
-        x_lo = max(0, x_c - half)
-        x_hi = min(lat_2d.shape[1], x_c + half)
+        # Clamp the low-corner so [y_lo, y_lo + patch_size_pix) is fully
+        # inside [0, H). Same for x.
+        y_lo = max(0, min(H - self.patch_size_pix, y_c - half))
+        y_hi = y_lo + self.patch_size_pix
+        x_lo = max(0, min(W - self.patch_size_pix, x_c - half))
+        x_hi = x_lo + self.patch_size_pix
         return slice(int(y_lo), int(y_hi)), slice(int(x_lo), int(x_hi))
 
     def get_valid_time(self, xds: xr.Dataset, **dims) -> pd.Timestamp:
@@ -404,5 +431,14 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
         xds.attrs["patch_center_lon"] = float(entry["lon_c"])
         xds.attrs["patch_source"] = entry["source"]
         xds.attrs["trajectory_id_str"] = entry["trajectory_id"]
+
+        # CRITICAL: Many patches within a single (case, start) share the SAME
+        # valid_time (they're time-aligned, differ only spatially), which would
+        # collide onto one output time slot via the target's default
+        # valid_time-based indexing. Set _sample_index so the Anemoi target
+        # uses our flat sample position as the time-axis index — same hook
+        # WoFSCast uses for ensemble members sharing valid_times.
+        init_idx = self.init_time.index(init_time)
+        xds.attrs["_sample_index"] = init_idx * self.n_steps + forecast_step
 
         return xds

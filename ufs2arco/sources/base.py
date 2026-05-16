@@ -19,6 +19,13 @@ class Source:
     available_variables = tuple()
     available_levels = tuple()
 
+    # Set True when the source-declared static variables (ter, landmask, …)
+    # vary across samples — e.g. a patch-based source where each sample is
+    # a different spatial slice. In that case the anemoi writer must not
+    # let anemoi.datasets auto-classify those variables as constant_in_time
+    # (their within-sample tendency is 0, which the auto-detector misreads).
+    statics_vary_per_sample: bool = False
+
     @property
     def rename(self) -> dict:
         """

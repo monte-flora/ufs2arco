@@ -607,7 +607,33 @@ class Anemoi(Target):
             logger.info(f"Computing spectral + gradient statistics")
             self.calc_spectral_gradient_stats(topo)
             logger.info(f"Done computing spectral + gradient statistics\n")
-    
+
+        if topo.is_root and getattr(self.source, "statics_vary_per_sample", False):
+            self._write_empty_constant_fields()
+
+        topo.barrier()
+
+    def _write_empty_constant_fields(self) -> None:
+        """Stamp an empty ``constant_fields`` list on the zarr root.
+
+        Required for sources where static vars (ter, landmask, per-patch
+        lat/lon) vary across samples. Without this, anemoi.datasets'
+        ``_compute_constant_fields_from_statistics`` misclassifies them
+        as constant (their tendency stdev within a trajectory is 0), and
+        ``typed_variables`` then stamps ``constant_in_time=True`` on them.
+        Writing an explicit empty list short-circuits the auto-detector in
+        ``anemoi/datasets/data/stores.py``'s ``constant_fields`` property
+        (which only recomputes if the attr is ``None``).
+        """
+        import zarr as z
+
+        g = z.open_group(str(self.store_path), mode="a")
+        g.attrs["constant_fields"] = []
+        logger.info(
+            f"{self.name}._write_empty_constant_fields: stamped constant_fields=[] "
+            f"on {self.store_path} (source.statics_vary_per_sample=True)"
+        )
+
     def add_trajectory_ids(self)->None:
         """
         Add the unique trajectory ids for each model init
