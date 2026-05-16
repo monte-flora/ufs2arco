@@ -44,6 +44,7 @@ class DataMover():
         batch_size,
         transformer=None,
         start=0,
+        stop=None,
         cache_dir=".",
     ):
 
@@ -52,6 +53,7 @@ class DataMover():
         self.transformer = transformer if transformer is not None else lambda xds: xds
         self.batch_size = batch_size
         self.start = start
+        self.stop = stop  # exclusive batch upper bound; None means run to end
         self.counter = start
         self.data_counter = start
         self.outer_cache_dir = cache_dir
@@ -273,6 +275,7 @@ class MPIDataMover(DataMover):
         mpi_topo,
         transformer=None,
         start=0,
+        stop=None,
         cache_dir=".",
     ):
         assert _has_mpi, f"{self.name}.__init__: Unable to import mpi4py, cannot use this class"
@@ -287,6 +290,7 @@ class MPIDataMover(DataMover):
             batch_size=batch_size,
             transformer=transformer,
             start=start,
+            stop=stop,
             cache_dir=cache_dir,
         )
         logger.info(str(self))

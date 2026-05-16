@@ -21,6 +21,7 @@ import ufs2arco.sources
 from ufs2arco.transforms import Transformer
 import ufs2arco.targets
 from ufs2arco.datamover import DataMover, MPIDataMover
+from ufs2arco import tranches as _tranches
 
 logger = logging.getLogger("ufs2arco")
 
@@ -80,6 +81,10 @@ class Driver:
             AssertionError: If required sections or keys are missing in the configuration.
             NotImplementedError: If a source, target, or mover is not recognized.
         """
+        self.config_filename = config_filename
+        # tranche_id is set when the driver is run with --tranche=N; used to
+        # produce per-tranche missing.<zarr>.tranche_<N>.yaml files.
+        self.tranche_id = None
         with open(config_filename, "r") as f:
             self.config = yaml.safe_load(f)
         
@@ -258,18 +263,38 @@ class Driver:
         self.topo.barrier()
 
 
-    def run(self, overwrite: bool = False):
+    def run(
+        self,
+        overwrite: bool = False,
+        tranche_id: int = None,
+        finalize_only: bool = False,
+        force: bool = False,
+    ):
         """Runs the data movement process, managing the datasets and mover.
 
         This method sets up the datasets, creates the container, and loops through
         batches to move data to the specified store path (Zarr format).
 
         Args:
-            overwrite (bool, optional): Whether to overwrite the existing container.
-                Defaults to False.
+            overwrite: Whether to overwrite the existing container. Allowed only
+                in single-shot mode or with ``tranche_id=0``.
+            tranche_id: If set, run only the batch range listed for that tranche
+                in the tranche manifest at <recipe-stem>.tranches.yaml. The batch
+                loop is bounded by [tranche.start, tranche.stop) and finalize is
+                skipped — the user must run ``--finalize`` after all tranches done.
+            finalize_only: Skip the batch loop entirely; only run target.finalize()
+                and finalize_attributes() on the existing zarr.
+            force: Bypass safety checks (e.g., finalize-with-pending-tranches).
         """
-        
+        if finalize_only:
+            self._run_finalize_only(force=force)
+            return
+
         self.setup(runtype="create")
+
+        # tranche-specific overrides
+        if tranche_id is not None:
+            self._apply_tranche(tranche_id, overwrite=overwrite)
 
         # create container, only if mover start is not 0
         if self.mover.start == 0:
@@ -277,44 +302,165 @@ class Driver:
 
         # loop through batches
         n_batches = len(self.mover)
+        upper = (
+            min(n_batches, self.mover.stop)
+            if self.mover.stop is not None
+            else n_batches
+        )
         missing_dims = []
-        for batch_idx in range(self.mover.start, n_batches):
+        try:
+            for batch_idx in range(self.mover.start, upper):
 
-            xds = next(self.mover)
+                xds = next(self.mover)
 
-            # xds is None if MPI rank looks for non existent indices (i.e., last batch scenario)
-            # len(xds) == 0 if we couldn't find the file we were looking for
-            has_content = xds is not None and len(xds) > 0
-            if has_content:
+                # xds is None if MPI rank looks for non existent indices (i.e., last batch scenario)
+                # len(xds) == 0 if we couldn't find the file we were looking for
+                has_content = xds is not None and len(xds) > 0
+                if has_content:
 
-                xds = xds.reset_coords(drop=True)
-                region = self.mover.find_my_region(xds)
-                try:
-                    xds.to_zarr(self.store_path, region=region)
-                except Exception as e:
-                    print(f"\n {xds=}")
-                    traceback.print_exc()
-                    break 
-                self.mover.clear_cache(batch_idx)
+                    xds = xds.reset_coords(drop=True)
+                    region = self.mover.find_my_region(xds)
+                    try:
+                        xds.to_zarr(self.store_path, region=region)
+                    except Exception as e:
+                        print(f"\n {xds=}")
+                        traceback.print_exc()
+                        break
+                    self.mover.clear_cache(batch_idx)
 
-            elif xds is not None:
+                elif xds is not None:
 
-                # we couldn't find the file, keep track of it
-                batch_indices = self.mover.get_batch_indices(batch_idx)
-                for these_dims in batch_indices:
-                    # Enrich with valid_time if available in dataset attrs
-                    these_dims_enriched = these_dims.copy()
-                    if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
-                        these_dims_enriched['valid_time'] = xds.attrs['valid_time']
-                    missing_dims.append(these_dims_enriched)
+                    # we couldn't find the file, keep track of it
+                    batch_indices = self.mover.get_batch_indices(batch_idx)
+                    for these_dims in batch_indices:
+                        # Enrich with valid_time if available in dataset attrs
+                        these_dims_enriched = these_dims.copy()
+                        if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
+                            these_dims_enriched['valid_time'] = xds.attrs['valid_time']
+                        missing_dims.append(these_dims_enriched)
 
-            logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
+                logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
+        except Exception:
+            # Mark the tranche failed so the manifest reflects reality.
+            if tranche_id is not None:
+                self._mark_tranche_done(tranche_id, state="failed")
+            raise
 
         self.topo.barrier()
         logger.info(f"Done moving the data\n")
 
         self.report_missing_data(missing_dims)
-        
+
+        if tranche_id is None:
+            # Single-shot run: finalize as usual.
+            self.target.finalize(self.topo)
+            self.finalize_attributes()
+        else:
+            # Tranche run: skip finalize. Mark this tranche done.
+            self._mark_tranche_done(tranche_id, state="done")
+            logger.info(
+                f"Tranche {tranche_id} complete. Finalize is deferred — run "
+                f"`ufs2arco {self.config_filename} --finalize` once all tranches are done."
+            )
+
+    # ------------------------------------------------------------------
+    # tranche / finalize helpers
+    # ------------------------------------------------------------------
+    def _apply_tranche(self, tranche_id: int, overwrite: bool):
+        """Load the tranche manifest, override mover.start/stop, mark running."""
+        manifest_path = _tranches.default_tranche_path(self.config_filename)
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(
+                f"--tranche={tranche_id} but no tranche manifest at {manifest_path}.\n"
+                f"Generate one with: python -m ufs2arco.tranches init "
+                f"{self.config_filename} --num-tranches N --mpi-batch-size B"
+            )
+        manifest = _tranches.load_manifest(manifest_path, recipe_path=self.config_filename)
+        tranche = _tranches.get_tranche(manifest, tranche_id)
+
+        # Sanity: batch_size at runtime must match the manifest's recorded
+        # batch_size, otherwise [start, stop) maps to different samples.
+        runtime_bs = self.mover.batch_size
+        manifest_bs = manifest["batch_size"]
+        if runtime_bs != manifest_bs:
+            raise RuntimeError(
+                f"Tranche manifest assumes batch_size={manifest_bs} but the "
+                f"current run is using batch_size={runtime_bs}. Re-run with the "
+                f"same MPI rank count, or regenerate the manifest with the new "
+                f"batch size."
+            )
+
+        # Guard against accidental container truncation on later tranches.
+        if overwrite and tranche["start"] != 0:
+            raise ValueError(
+                f"--overwrite is allowed only with tranche 0 (start=0). "
+                f"Tranche {tranche_id} starts at batch {tranche['start']}."
+            )
+
+        self.tranche_id = tranche_id
+        self.mover.start = tranche["start"]
+        self.mover.stop = tranche["stop"]
+        self.mover.counter = tranche["start"]
+        self.mover.data_counter = tranche["start"]
+        self.mover.restart(idx=tranche["start"])
+        self._tranche_manifest_path = manifest_path
+
+        if self.topo.is_root:
+            _tranches.update_state(
+                manifest_path,
+                tranche_id,
+                state="running",
+                started_utc=datetime.utcnow().isoformat() + "Z",
+                finished_utc=None,
+            )
+
+    def _mark_tranche_done(self, tranche_id: int, state: str = "done"):
+        """Update the tranche state in the manifest from rank 0."""
+        if not self.topo.is_root:
+            return
+        path = getattr(self, "_tranche_manifest_path", None)
+        if path is None:
+            return
+        try:
+            _tranches.update_state(
+                path,
+                tranche_id,
+                state=state,
+                finished_utc=datetime.utcnow().isoformat() + "Z",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update tranche manifest state: {e}")
+
+    def _run_finalize_only(self, force: bool = False):
+        """Skip ingest entirely; run target.finalize() + finalize_attributes()
+        on the populated zarr.
+        """
+        self.setup(runtype="finalize")
+
+        # If a tranche manifest exists, verify all tranches are done (or --force).
+        manifest_path = _tranches.default_tranche_path(self.config_filename)
+        if os.path.exists(manifest_path):
+            try:
+                manifest = _tranches.load_manifest(
+                    manifest_path, recipe_path=self.config_filename,
+                )
+                ok, pending = _tranches.verify_complete(manifest)
+                if not ok:
+                    msg = (
+                        f"--finalize: {len(pending)} tranche(s) are not done: "
+                        f"{pending}. Run them first, or pass --force to "
+                        f"finalize anyway."
+                    )
+                    if force:
+                        logger.warning(msg + " (forcing)")
+                    else:
+                        raise RuntimeError(msg)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.warning(f"Tranche manifest unreadable; proceeding: {e}")
+
+        logger.info(f"Driver._run_finalize_only: finalizing {self.store_path}")
         self.target.finalize(self.topo)
         self.finalize_attributes()
 
@@ -385,7 +531,12 @@ class Driver:
         # Handle relative paths (directory could be empty string)
         if not directory:
             directory = "."
-        return f"{directory}/missing.{zstore}.yaml"
+        # Per-tranche files preserve missing-data state across sessions —
+        # without this each tranche would clobber the prior tranche's record.
+        suffix = ""
+        if getattr(self, "tranche_id", None) is not None:
+            suffix = f".tranche_{self.tranche_id}"
+        return f"{directory}/missing.{zstore}{suffix}.yaml"
 
     def report_missing_data(self, missing_dims):
 

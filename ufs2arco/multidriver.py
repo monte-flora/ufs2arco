@@ -32,6 +32,7 @@ from ufs2arco import targets
 from ufs2arco.datamover import DataMover, MPIDataMover
 
 from ufs2arco.driver import Driver
+from ufs2arco import tranches as _tranches
 
 logger = logging.getLogger("ufs2arco")
 
@@ -196,19 +197,44 @@ class MultiDriver(Driver):
         self.topo.barrier()
 
 
-    def run(self, overwrite: bool = False, validate: bool = False):
+    def run(
+        self,
+        overwrite: bool = False,
+        validate: bool = False,
+        tranche_id: int = None,
+        finalize_only: bool = False,
+        force: bool = False,
+    ):
         """Runs the data movement process, managing the datasets and mover.
 
-        This method sets up the datasets, creates the container, and loops through
-        batches to move data to the specified store path (Zarr format).
-
         Args:
-            overwrite (bool, optional): Whether to overwrite the existing container.
-                Defaults to False.
-            validate (bool, optional): If true, validate the configs, but 
-                without saving data. Defaults to False
+            overwrite: Whether to overwrite the existing container. Allowed only
+                in single-shot mode or with ``tranche_id=0``.
+            validate: If true, validate the configs without saving data.
+            tranche_id: If set, run only the batch range listed for that tranche
+                in the tranche manifest at <recipe-stem>.tranches.yaml. The batch
+                loop is bounded by [tranche.start, tranche.stop) and finalize is
+                skipped — the user must run ``--finalize`` after all tranches done.
+            finalize_only: Skip the batch loop entirely; only run target.finalize()
+                and finalize_attributes() on the existing zarr.
+            force: Bypass safety checks (e.g., finalize-with-pending-tranches).
         """
+        if finalize_only:
+            self._run_finalize_only(force=force)
+            return
+
         self.setup(runtype="create")
+
+        # tranche-specific overrides — apply to ALL movers since the multidriver
+        # iterates each per batch.
+        if tranche_id is not None:
+            self._apply_tranche(tranche_id, overwrite=overwrite)
+            for m in self.movers[1:]:
+                m.start = self.mover.start
+                m.stop = self.mover.stop
+                m.counter = self.mover.start
+                m.data_counter = self.mover.start
+                m.restart(idx=self.mover.start)
 
         # create container, only if mover start is not 0
         if self.mover.start == 0:
@@ -216,52 +242,68 @@ class MultiDriver(Driver):
 
         # loop through batches
         n_batches = len(self.mover)
+        upper = (
+            min(n_batches, self.mover.stop)
+            if self.mover.stop is not None
+            else n_batches
+        )
         missing_dims = []
-        for batch_idx in range(self.mover.start, n_batches):
+        try:
+            for batch_idx in range(self.mover.start, upper):
 
-            dslist = list()
-            foundit = list()
-            for mover in self.movers:
+                dslist = list()
+                foundit = list()
+                for mover in self.movers:
 
-                xds = next(mover)
+                    xds = next(mover)
 
-                # xds is None if MPI rank looks for non existent indices (i.e., last batch scenario)
-                # len(xds) == 0 if we couldn't find the file we were looking for
-                has_content = xds is not None and len(xds) > 0
-                if has_content:
-                    foundit.append(True)
-                    dslist.append(xds.reset_coords(drop=True))
+                    has_content = xds is not None and len(xds) > 0
+                    if has_content:
+                        foundit.append(True)
+                        dslist.append(xds.reset_coords(drop=True))
 
-                elif xds is not None:
+                    elif xds is not None:
 
-                    foundit.append(False)
-                    batch_indices = mover.get_batch_indices(batch_idx)
-                    for these_dims in batch_indices:
-                        # Enrich with valid_time if available in dataset attrs
-                        these_dims_enriched = these_dims.copy()
-                        if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
-                            these_dims_enriched['valid_time'] = xds.attrs['valid_time']
-                        missing_dims.append(these_dims_enriched)
+                        foundit.append(False)
+                        batch_indices = mover.get_batch_indices(batch_idx)
+                        for these_dims in batch_indices:
+                            these_dims_enriched = these_dims.copy()
+                            if hasattr(xds, 'attrs') and 'valid_time' in xds.attrs:
+                                these_dims_enriched['valid_time'] = xds.attrs['valid_time']
+                            missing_dims.append(these_dims_enriched)
 
-            # we need both conditionals, since all([]) == True
-            if all(foundit) and len(foundit) == len(self.movers):
-                mds = self.target.merge_multisource(dslist)
-                region = self.mover.find_my_region(mds)
-                if not validate:
-                    # Use ProgressBar for the zarr write operation
-                    mds.to_zarr(self.target.store_path, region=region)
+                # we need both conditionals, since all([]) == True
+                if all(foundit) and len(foundit) == len(self.movers):
+                    mds = self.target.merge_multisource(dslist)
+                    region = self.mover.find_my_region(mds)
+                    if not validate:
+                        mds.to_zarr(self.target.store_path, region=region)
 
-            self.mover.clear_cache(batch_idx)
+                self.mover.clear_cache(batch_idx)
 
-            logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
+                logger.info(f"Done with batch {batch_idx+1} / {n_batches}")
+        except Exception:
+            if tranche_id is not None:
+                self._mark_tranche_done(tranche_id, state="failed")
+            raise
 
         self.topo.barrier()
         logger.info(f"Done moving the data\n")
 
-        if not validate:
-            self.report_missing_data(missing_dims)
+        if validate:
+            return
+
+        self.report_missing_data(missing_dims)
+
+        if tranche_id is None:
             self.target.finalize(self.topo)
             self.finalize_attributes()
+        else:
+            self._mark_tranche_done(tranche_id, state="done")
+            logger.info(
+                f"Tranche {tranche_id} complete. Finalize is deferred — run "
+                f"`ufs2arco {self.config_filename} --finalize` once all tranches are done."
+            )
 
     def patch(self):
         raise NotImplementedError

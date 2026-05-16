@@ -60,7 +60,7 @@ def _raymond_apply_axis_batched(arr: np.ndarray, axis: int, eps: float) -> np.nd
     return np.transpose(y, perm)           # un-swap — same perm is self-inverse
 
 
-def raymond_filter_2d(field_2d, eps=0.5, order=6):
+def raymond_filter_2d(field_2d, eps=0.5, order=6, pad=8, pad_mode="reflect"):
     """Vectorized Raymond (1988) implicit tangent low-pass filter in both
     spatial directions. Accepts ``(..., ny, nx)`` with arbitrary leading
     batch dims — level / variable / ensemble all handled in a single
@@ -76,18 +76,39 @@ def raymond_filter_2d(field_2d, eps=0.5, order=6):
     order : int
         Filter order (2, 4, or 6). Achieved by repeated application of
         the 2nd-order filter. Higher order = sharper spectral cutoff.
+    pad : int
+        Number of cells of padding to apply on each side of the (y, x)
+        plane before filtering. Trimmed back to the original shape after.
+        The implicit filter has zero-Dirichlet-like boundary behavior in
+        ``solve_banded``, which produces a ringing artifact in the outer
+        ~``order`` cells (e.g. ~108 K t2m on what should be ~290 K).
+        Padding by ``order + 2`` cells with mirroring shifts the artifact
+        into the discarded padded region. Set ``pad=0`` to recover the
+        legacy (artifact-prone) behavior for backward-compat tests.
+    pad_mode : str
+        Anything accepted by :func:`numpy.pad`. ``"reflect"`` mirrors
+        across the boundary cell (no duplication) — preserves the mean
+        and the gradient continuity for atmospheric fields.
     """
     n_passes = order // 2
-    result = field_2d.astype(np.float64)
+    if pad > 0:
+        pad_width = [(0, 0)] * (field_2d.ndim - 2) + [(pad, pad), (pad, pad)]
+        result = np.pad(field_2d, pad_width, mode=pad_mode).astype(np.float64)
+    else:
+        result = field_2d.astype(np.float64)
     for _ in range(n_passes):
         # Filter along x (last axis)
         result = _raymond_apply_axis_batched(result, axis=-1, eps=eps)
         # Filter along y (second-to-last axis)
         result = _raymond_apply_axis_batched(result, axis=-2, eps=eps)
+    if pad > 0:
+        sl = (slice(None),) * (field_2d.ndim - 2) + (slice(pad, -pad), slice(pad, -pad))
+        result = result[sl]
     return result.astype(np.float32)
 
 
-def apply_raymond_filter_to_dataset(xds, eps=0.5, order=6, level_dim='level'):
+def apply_raymond_filter_to_dataset(xds, eps=0.5, order=6, level_dim='level',
+                                    pad=8, pad_mode="reflect"):
     """Apply Raymond filter to all 3D variables in an xarray Dataset.
 
     Filters each 2D (y, x) slice at each vertical level independently.
@@ -103,13 +124,33 @@ def apply_raymond_filter_to_dataset(xds, eps=0.5, order=6, level_dim='level'):
         Filter order (2, 4, or 6).
     level_dim : str
         Name of the vertical level dimension.
+    pad, pad_mode :
+        Forwarded to :func:`raymond_filter_2d` for boundary handling.
+        Defaults (8 cells, reflect) suppress the ringing artifact at
+        each (y, x) edge of the filtered slice.
 
     Returns
     -------
     xr.Dataset with filtered data variables.
     """
-    # Variables to skip (static, coordinate-like, or 2D)
-    skip_vars = {'latitude', 'longitude', 'surface_elevation', 'land_sea_mask'}
+    # Variables to skip — coordinates and every static field that may live
+    # in the regridded static NetCDF (post-rename names from
+    # AWSGRAFArchive.STATIC_VAR_RENAMER plus pass-through names for fields
+    # without a rename). Static fields are time-invariant by definition,
+    # so spatial smoothing has no scientific motivation and can corrupt
+    # categorical fields (vegetation/soil type) outright.
+    skip_vars = {
+        # coords
+        'latitude', 'longitude',
+        # renamed
+        'surface_elevation', 'land_sea_mask', 'climo_soiltemp',
+        'subgrid_terrain_variance', 'terrain_convexity',
+        'orographic_asymmetry_we', 'orographic_asymmetry_sn',
+        'orographic_asymmetry_swne', 'orographic_asymmetry_nwse',
+        # pass-through (no entry in STATIC_VAR_RENAMER)
+        'ivgtyp', 'isltyp', 'snoalb', 'greenfrac', 'shdmin', 'shdmax',
+        'albedo12m', 'varsso', 'ol1', 'ol2', 'ol3', 'ol4',
+    }
 
     updates = {}
     for var_name in xds.data_vars:
@@ -134,7 +175,8 @@ def apply_raymond_filter_to_dataset(xds, eps=0.5, order=6, level_dim='level'):
         if np.isnan(vals).any():
             continue
 
-        filtered = raymond_filter_2d(vals, eps=eps, order=order)
+        filtered = raymond_filter_2d(vals, eps=eps, order=order,
+                                     pad=pad, pad_mode=pad_mode)
         # Move (y, x) back to their original positions
         filtered = np.moveaxis(filtered, (-2, -1), (y_axis, x_axis))
 
