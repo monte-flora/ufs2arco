@@ -15,6 +15,9 @@ _recognized = {
     "aws_graf_regridded_archive": "AWSGRAFRegriddedArchive",
     "aws_graf_regridded_patches": "AWSGRAFRegriddedPatchesArchive",
     "wofscast_archive": "WoFSCastArchive",
+    "aws_mrms_archive": "AWSMRMSArchive",
+    "aws_mrms_patches": "AWSMRMSPatches",
+    "aws_hrrr_patches": "AWSHRRRPatches",
 }
 
 # Lazy imports: source classes are only imported when accessed by name.
@@ -31,6 +34,9 @@ _lazy_imports = {
     "AWSGRAFRegriddedArchive": ".aws_graf_reforecast_regridded",
     "AWSGRAFRegriddedPatchesArchive": ".aws_graf_regridded_patches",
     "WoFSCastArchive": ".wofscast",
+    "AWSMRMSArchive": ".aws_mrms_archive",
+    "AWSMRMSPatches": ".aws_mrms_patches",
+    "AWSHRRRPatches": ".aws_hrrr_patches",
 }
 
 

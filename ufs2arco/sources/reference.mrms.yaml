@@ -1,0 +1,12 @@
+# Variable metadata for AWSMRMSArchive
+#
+# MRMS GRIB2 files use a custom NOAA local parameter table (paramId=0),
+# so cfgrib resolves the variable name as 'unknown'. The 'original_name'
+# field maps the cfgrib name to our internal name.
+
+qpe_01h:
+  filter_by_keys:
+    typeOfLevel: heightAboveSea
+  long_name: Multi-sensor QPE 1-hour accumulation (Pass 2, gauge-corrected)
+  original_name: unknown
+  units: mm
