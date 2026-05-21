@@ -86,18 +86,19 @@ class AWSHRRRPatches(Source):
     """
     HRRR f0X patch source driven by a pre-built manifest JSON.
 
-    For each (valid_time, patch_step) the source:
+    Iterates directly over manifest entries (sample_dims = ("sample",)).
+    The DataMover calls open_sample_dataset({"sample": i}) for each entry,
+    bypassing the Cartesian-product constraint that required a uniform patch
+    count per valid_time.
+
+    For each manifest entry the source:
       1. Derives t0 = valid_time - fhr hours for each requested forecast_hour
       2. Opens the UofUtah HRRR Zarr at s3://hrrrzarr/sfc/YYYYMMDD/...
       3. Extracts a 96×96-cell halo at (hrrr_y0, hrrr_x0)
       4. Returns one channel per (variable, forecast_hour): APCP_f02, CAPE_ML_f02, …
-
-    lat/lon are the actual HRRR grid coordinates for the extracted halo.
-    The ufs2arco anemoi target writer will compute cos/sin lat/lon forcings
-    from these coordinates when declared in the build YAML's `forcings:` list.
     """
 
-    sample_dims = ("valid_time", "patch_step")
+    sample_dims = ("sample",)
     horizontal_dims = ("y", "x")
     available_levels = ()
     statics_vary_per_sample = True
@@ -113,10 +114,9 @@ class AWSHRRRPatches(Source):
         slices: dict | None = None,
         patch_size: int = 96,
     ) -> None:
-        # Must be set before super().__init__() which calls __str__ → sample_dims properties
         self._base_vars = list(variables)
-        self._valid_time_list: list[pd.Timestamp] = []
-        self._n_patches: int = 0
+        # _entries must exist before super().__init__() which calls __str__ → sample property
+        self._entries: list[dict] = []
         super().__init__(
             variables=variables,
             levels=levels,
@@ -127,38 +127,15 @@ class AWSHRRRPatches(Source):
         self.forecast_hours = list(forecast_hours)
 
         with open(manifest_path) as f:
-            entries = json.load(f)
+            self._entries = json.load(f)
 
-        self._manifest_by_time: dict[pd.Timestamp, list[dict]] = {}
-        for e in entries:
-            t = pd.Timestamp(e["valid_time"])
-            self._manifest_by_time.setdefault(t, []).append(e)
-
-        counts = {t: len(v) for t, v in self._manifest_by_time.items()}
-        unique_counts = set(counts.values())
-        if len(unique_counts) != 1:
-            raise ValueError(
-                f"AWSHRRRPatches: manifest has non-uniform patch counts: "
-                f"{unique_counts}"
-            )
-        self._n_patches = unique_counts.pop()
-        self._valid_time_list = sorted(self._manifest_by_time.keys())
-
-        self._trajectory_ids = [
-            e["trajectory_id"]
-            for t in self._valid_time_list
-            for e in self._manifest_by_time[t]
-        ]
-
-        # per-(t0, fhr) zarr array cache to avoid re-opening for each patch
         self._zarr_cache: dict[tuple, zarr.Array] = {}
         self._fs: s3fs.S3FileSystem | None = None
         self._hgt_full: np.ndarray | None = None
 
         logger.info(
-            f"AWSHRRRPatches: {len(self._valid_time_list)} times × "
-            f"{self._n_patches} patches, vars={self._base_vars}, "
-            f"fhrs={self.forecast_hours}"
+            f"AWSHRRRPatches: {len(self._entries)} samples, "
+            f"vars={self._base_vars}, fhrs={self.forecast_hours}"
         )
 
     # ------------------------------------------------------------------
@@ -166,12 +143,8 @@ class AWSHRRRPatches(Source):
     # ------------------------------------------------------------------
 
     @property
-    def valid_time(self) -> list[pd.Timestamp]:
-        return self._valid_time_list
-
-    @property
-    def patch_step(self) -> list[int]:
-        return list(range(self._n_patches))
+    def sample(self) -> list[int]:
+        return list(range(len(self._entries)))
 
     @property
     def available_variables(self) -> tuple:
@@ -179,19 +152,15 @@ class AWSHRRRPatches(Source):
 
     @property
     def trajectory_ids(self) -> list:
-        return self._trajectory_ids
+        return [e["trajectory_id"] for e in self._entries]
 
     @property
     def n_samples(self) -> int:
-        return len(self._valid_time_list) * self._n_patches
+        return len(self._entries)
 
     @property
     def valid_times(self) -> pd.DatetimeIndex:
-        return pd.DatetimeIndex([
-            t
-            for t in self._valid_time_list
-            for _ in range(self._n_patches)
-        ])
+        return pd.DatetimeIndex([pd.Timestamp(e["valid_time"]) for e in self._entries])
 
     # ------------------------------------------------------------------
     # Sample fetching
@@ -203,10 +172,10 @@ class AWSHRRRPatches(Source):
         open_static_vars: bool = True,
         cache_dir: str | None = None,
     ) -> xr.Dataset:
-        t: pd.Timestamp = dims["valid_time"]
-        k: int = dims["patch_step"]
+        i: int = dims["sample"]
+        entry = self._entries[i]
 
-        entry = self._manifest_by_time[t][k]
+        t = pd.Timestamp(entry["valid_time"])
         y0, x0 = int(entry["hrrr_y0"]), int(entry["hrrr_x0"])
         ps = self.patch_size
         y_sl = slice(y0, y0 + ps)
@@ -240,34 +209,19 @@ class AWSHRRRPatches(Source):
             for vname in self._base_vars:
                 data_vars[f"{vname}_f{fhr:02d}"] = (["y", "x"], tiles[vname])
 
-        # HRRR lat/lon for this patch
         hrrr_lat, hrrr_lon = _get_hrrr_latlon()
         lat2d = hrrr_lat[y_sl, x_sl].astype(np.float64)
         lon2d = hrrr_lon[y_sl, x_sl].astype(np.float64)
 
-        # Wrap each (y, x) array into a (time=1, y, x) array so the Anemoi
-        # target can rename the `time` dim to `dates` and place the sample
-        # at the correct integer slot via `_sample_index`.
-        time_idx = self._valid_time_list.index(t)
-        sample_idx = time_idx * self._n_patches + k
-
-        # latitude, longitude, and valid_time must be data variables (not just
-        # coordinates) so that xds.expand_dims({"ensemble": [0]}) in the Anemoi
-        # target broadcasts them, making lat.isel(ensemble=0) and
-        # valid_time.squeeze("ensemble") work downstream.
-        timed_vars = {varname: (["time", "y", "x"], v[1][np.newaxis]) for varname, v in data_vars.items()}
+        # latitude, longitude, and valid_time must be data variables so that
+        # expand_dims({"ensemble": [0]}) in the Anemoi target broadcasts them.
+        timed_vars = {k: (["time", "y", "x"], v[1][np.newaxis]) for k, v in data_vars.items()}
         timed_vars["latitude"]   = (["y", "x"], lat2d)
         timed_vars["longitude"]  = (["y", "x"], lon2d)
         timed_vars["valid_time"] = (["time"], pd.DatetimeIndex([t]))
 
-        xds = xr.Dataset(
-            timed_vars,
-            coords={
-                "time": pd.DatetimeIndex([t]),
-            },
-        )
-        xds.attrs["_sample_index"] = sample_idx
-
+        xds = xr.Dataset(timed_vars, coords={"time": pd.DatetimeIndex([t])})
+        xds.attrs["_sample_index"] = i
         return xds
 
     # ------------------------------------------------------------------

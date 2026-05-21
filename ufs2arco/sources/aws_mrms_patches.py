@@ -48,18 +48,13 @@ class AWSMRMSPatches(Source):
     """
     MRMS QPE patch source driven by a pre-built manifest JSON.
 
-    Manifest format (list of dicts, one per patch):
-        valid_time, patch_idx, mrms_y0, mrms_x0, hrrr_y0, hrrr_x0,
-        lat_c, lon_c, source, intensity, trajectory_id
-
-    All valid_times must have the same patch count (enforced at manifest build
-    time by superres_precip.data.patch_sampler.build_manifest).
-
-    ufs2arco DataMover iterates the Cartesian product:
-        valid_time × patch_step  →  open_sample_dataset(dims, ...)
+    Iterates directly over manifest entries (sample_dims = ("sample",)).
+    The DataMover calls open_sample_dataset({"sample": i}) for each entry,
+    bypassing the Cartesian-product constraint that required a uniform patch
+    count per valid_time.
     """
 
-    sample_dims = ("valid_time", "patch_step")
+    sample_dims = ("sample",)
     horizontal_dims = ("y", "x")
     available_levels = ()
     statics_vary_per_sample = True
@@ -74,9 +69,8 @@ class AWSMRMSPatches(Source):
         slices: dict | None = None,
         patch_size: int = 256,
     ) -> None:
-        # Must be set before super().__init__() which calls __str__ → sample_dims properties
-        self._valid_time_list: list[pd.Timestamp] = []
-        self._n_patches: int = 0
+        # _entries must exist before super().__init__() which calls __str__ → sample property
+        self._entries: list[dict] = []
         super().__init__(
             variables=variables,
             levels=levels,
@@ -86,52 +80,21 @@ class AWSMRMSPatches(Source):
         self.patch_size = patch_size
 
         with open(manifest_path) as f:
-            entries = json.load(f)
+            self._entries = json.load(f)
 
-        # group by valid_time (preserve manifest order within each group)
-        self._manifest_by_time: dict[pd.Timestamp, list[dict]] = {}
-        for e in entries:
-            t = pd.Timestamp(e["valid_time"])
-            self._manifest_by_time.setdefault(t, []).append(e)
-
-        counts = {t: len(v) for t, v in self._manifest_by_time.items()}
-        unique_counts = set(counts.values())
-        if len(unique_counts) != 1:
-            raise ValueError(
-                f"AWSMRMSPatches: manifest has non-uniform patch counts per "
-                f"valid_time: {unique_counts}. Re-build with a fixed "
-                f"n_patches_per_time."
-            )
-        self._n_patches = unique_counts.pop()
-        self._valid_time_list = sorted(self._manifest_by_time.keys())
-
-        # trajectory_id index: global ordinal → trajectory_id string
-        self._trajectory_ids = [
-            e["trajectory_id"]
-            for t in self._valid_time_list
-            for e in self._manifest_by_time[t]
-        ]
-
-        # per-time QPE cache (avoids re-downloading for each patch_step)
+        # per-time QPE cache: keyed by Timestamp, holds most-recent time only
         self._qpe_cache: dict[pd.Timestamp, np.ndarray] = {}
         self._fs: s3fs.S3FileSystem | None = None
 
-        logger.info(
-            f"AWSMRMSPatches: {len(self._valid_time_list)} times × "
-            f"{self._n_patches} patches = {len(entries)} total"
-        )
+        logger.info(f"AWSMRMSPatches: {len(self._entries)} samples")
 
     # ------------------------------------------------------------------
     # DataMover-facing properties
     # ------------------------------------------------------------------
 
     @property
-    def valid_time(self) -> list[pd.Timestamp]:
-        return self._valid_time_list
-
-    @property
-    def patch_step(self) -> list[int]:
-        return list(range(self._n_patches))
+    def sample(self) -> list[int]:
+        return list(range(len(self._entries)))
 
     @property
     def available_variables(self) -> tuple:
@@ -139,19 +102,15 @@ class AWSMRMSPatches(Source):
 
     @property
     def trajectory_ids(self) -> list:
-        return self._trajectory_ids
+        return [e["trajectory_id"] for e in self._entries]
 
     @property
     def n_samples(self) -> int:
-        return len(self._valid_time_list) * self._n_patches
+        return len(self._entries)
 
     @property
     def valid_times(self) -> pd.DatetimeIndex:
-        return pd.DatetimeIndex([
-            t
-            for t in self._valid_time_list
-            for _ in range(self._n_patches)
-        ])
+        return pd.DatetimeIndex([pd.Timestamp(e["valid_time"]) for e in self._entries])
 
     # ------------------------------------------------------------------
     # Sample fetching
@@ -163,25 +122,19 @@ class AWSMRMSPatches(Source):
         open_static_vars: bool = True,
         cache_dir: str | None = None,
     ) -> xr.Dataset:
-        t: pd.Timestamp = dims["valid_time"]
-        k: int = dims["patch_step"]
+        i: int = dims["sample"]
+        entry = self._entries[i]
 
-        entry = self._manifest_by_time[t][k]
+        t = pd.Timestamp(entry["valid_time"])
         y0, x0 = int(entry["mrms_y0"]), int(entry["mrms_x0"])
         ps = self.patch_size
 
         qpe = self._get_qpe(t, cache_dir)
-        tile = qpe[y0:y0 + ps, x0:x0 + ps]            # (ps, ps) float32
-
+        tile = qpe[y0:y0 + ps, x0:x0 + ps].astype(np.float32)
         lat2d, lon2d = _mrms_patch_latlon(y0, x0, ps, ps)
 
-        time_idx = self._valid_time_list.index(t)
-        sample_idx = time_idx * self._n_patches + k
-
-        # latitude, longitude, and valid_time must be data variables (not just
-        # coordinates) so that xds.expand_dims({"ensemble": [0]}) in the Anemoi
-        # target broadcasts them, making lat.isel(ensemble=0) and
-        # valid_time.squeeze("ensemble") work downstream.
+        # latitude, longitude, and valid_time must be data variables so that
+        # expand_dims({"ensemble": [0]}) in the Anemoi target broadcasts them.
         xds = xr.Dataset(
             {
                 "qpe_01h":    (["time", "y", "x"], tile[np.newaxis]),
@@ -189,12 +142,9 @@ class AWSMRMSPatches(Source):
                 "longitude":  (["y", "x"], lon2d),
                 "valid_time": (["time"], pd.DatetimeIndex([t])),
             },
-            coords={
-                "time": pd.DatetimeIndex([t]),
-            },
+            coords={"time": pd.DatetimeIndex([t])},
         )
-        xds.attrs["_sample_index"] = sample_idx
-
+        xds.attrs["_sample_index"] = i
         return xds
 
     # ------------------------------------------------------------------
