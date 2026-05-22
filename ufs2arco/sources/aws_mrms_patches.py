@@ -68,9 +68,12 @@ class AWSMRMSPatches(Source):
         use_nearest_levels: bool = False,
         slices: dict | None = None,
         patch_size: int = 256,
+        static_path: str | None = None,
     ) -> None:
-        # _entries must exist before super().__init__() which calls __str__ → sample property
+        # _entries and _static must exist before super().__init__()
+        # which calls available_variables and __str__ → sample property
         self._entries: list[dict] = []
+        self._static: dict[str, np.ndarray] | None = None
         super().__init__(
             variables=variables,
             levels=levels,
@@ -86,6 +89,16 @@ class AWSMRMSPatches(Source):
         self._qpe_cache: dict[pd.Timestamp, np.ndarray] = {}
         self._fs: s3fs.S3FileSystem | None = None
 
+        # static terrain arrays — loaded once, shape (MRMS_NLAT, MRMS_NLON)
+        if static_path is not None:
+            import xarray as _xr
+            _ds = _xr.open_dataset(static_path)
+            self._static = {
+                v: _ds[v].values.astype(np.float32)
+                for v in ("smoothed_elev", "smoothed_elev_grad_ns", "smoothed_elev_grad_ew")
+            }
+            logger.info(f"AWSMRMSPatches: loaded static from {static_path}")
+
         logger.info(f"AWSMRMSPatches: {len(self._entries)} samples")
 
     # ------------------------------------------------------------------
@@ -98,7 +111,10 @@ class AWSMRMSPatches(Source):
 
     @property
     def available_variables(self) -> tuple:
-        return ("qpe_01h",)
+        base = ("qpe_01h",)
+        if self._static:
+            return base + tuple(self._static.keys())
+        return base
 
     @property
     def trajectory_ids(self) -> list:
@@ -135,15 +151,18 @@ class AWSMRMSPatches(Source):
 
         # latitude, longitude, and valid_time must be data variables so that
         # expand_dims({"ensemble": [0]}) in the Anemoi target broadcasts them.
-        xds = xr.Dataset(
-            {
-                "qpe_01h":    (["time", "y", "x"], tile[np.newaxis]),
-                "latitude":   (["y", "x"], lat2d),
-                "longitude":  (["y", "x"], lon2d),
-                "valid_time": (["time"], pd.DatetimeIndex([t])),
-            },
-            coords={"time": pd.DatetimeIndex([t])},
-        )
+        data_vars: dict = {
+            "qpe_01h":    (["time", "y", "x"], tile[np.newaxis]),
+            "latitude":   (["y", "x"], lat2d),
+            "longitude":  (["y", "x"], lon2d),
+            "valid_time": (["time"], pd.DatetimeIndex([t])),
+        }
+
+        if self._static is not None:
+            for vname, arr in self._static.items():
+                data_vars[vname] = (["time", "y", "x"], arr[y0:y0 + ps, x0:x0 + ps][np.newaxis])
+
+        xds = xr.Dataset(data_vars, coords={"time": pd.DatetimeIndex([t])})
         xds.attrs["_sample_index"] = i
         return xds
 

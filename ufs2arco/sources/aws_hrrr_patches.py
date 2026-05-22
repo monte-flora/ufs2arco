@@ -37,13 +37,15 @@ _PROJ_PARAMS = {
 }
 
 # Maps project-level variable names to (level_group, zarr_varname) in hrrrzarr.
-# OROLIFT is derived (U·∂HGT/∂x + V·∂HGT/∂y); not a direct zarr fetch.
+# OROLIFT is derived (U10·∂HGT/∂x + V10·∂HGT/∂y) using 10m winds; not a direct zarr fetch.
 _VARIABLE_PATHS = {
     "APCP":     ("surface",                 "APCP_1hr_acc_fcst"),    # 1-hr QPF, mm
     "CAPE_ML":  ("255_0mb_above_ground",    "CAPE"),                 # 0-255mb ML CAPE, J/kg
     "RH_2M":    ("2m_above_ground",         "RH"),                   # 2-m RH, %
     "UGRD_700": ("700mb",                   "UGRD"),                 # 700-mb U-wind, m/s
     "VGRD_700": ("700mb",                   "VGRD"),                 # 700-mb V-wind, m/s
+    "UGRD_10M": ("10m_above_ground",        "UGRD"),                 # 10-m U-wind, m/s (OROLIFT)
+    "VGRD_10M": ("10m_above_ground",        "VGRD"),                 # 10-m V-wind, m/s (OROLIFT)
     "MAXREF":   ("1000m_above_ground",      "MAXREF_1hr_max_fcst"),  # 1-hr max refl., dBZ
     "MAXUVV":   ("100_1000mb_above_ground", "MAXUVV_1hr_max_fcst"),  # 1-hr max upward vel., m/s
 }
@@ -183,8 +185,7 @@ class AWSHRRRPatches(Source):
 
         needs_orolift = "OROLIFT" in self._base_vars
         fetch_vars = [v for v in self._base_vars if v != "OROLIFT"]
-        if needs_orolift and not {"UGRD_700", "VGRD_700"}.issubset(self._base_vars):
-            raise ValueError("OROLIFT requires UGRD_700 and VGRD_700 in variables")
+        orolift_deps = {"UGRD_10M", "VGRD_10M"} if needs_orolift else set()
 
         data_vars = {}
         for fhr in self.forecast_hours:
@@ -192,7 +193,8 @@ class AWSHRRRPatches(Source):
             fhr_idx = fhr - 1  # hrrrzarr: forecast_period index 0 = f01
 
             tiles = {}
-            for vname in fetch_vars:
+            all_fetch = list(fetch_vars) + [v for v in orolift_deps if v not in fetch_vars]
+            for vname in all_fetch:
                 if vname not in _VARIABLE_PATHS:
                     raise ValueError(f"AWSHRRRPatches: unknown variable '{vname}'")
                 level_group, zarr_vname = _VARIABLE_PATHS[vname]
@@ -203,8 +205,10 @@ class AWSHRRRPatches(Source):
                 hgt_patch = self._get_hgt_patch(y_sl, x_sl)
                 dz_dy, dz_dx = np.gradient(hgt_patch.astype(np.float64), 3000.0, 3000.0)
                 tiles["OROLIFT"] = (
-                    tiles["UGRD_700"] * dz_dx + tiles["VGRD_700"] * dz_dy
+                    tiles["UGRD_10M"] * dz_dx + tiles["VGRD_10M"] * dz_dy
                 ).astype(np.float32)
+                for dep in orolift_deps - set(fetch_vars):
+                    del tiles[dep]
 
             for vname in self._base_vars:
                 data_vars[f"{vname}_f{fhr:02d}"] = (["y", "x"], tiles[vname])

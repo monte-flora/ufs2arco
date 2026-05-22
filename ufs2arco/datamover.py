@@ -312,6 +312,12 @@ class MPIDataMover(DataMover):
         return f"{self.outer_cache_dir}/{self.name.lower()}-cache/{self.topo.rank}/{batch_idx}"
 
     def get_batch_indices(self, batch_idx):
-        st = (batch_idx * self.batch_size) + self.local_batch_index
-        ed = st + self.data_per_process
-        return self.sample_indices[st:ed]
+        # Contiguous block assignment: rank r owns sample_indices[r*block:(r+1)*block].
+        # Within that block, batch_idx is the local step index.
+        # This ensures consecutive calls on the same rank are adjacent in the manifest,
+        # which makes per-init-time caches (e.g. HRRR GRIB2) effective.
+        block = len(self)  # == ceil(n_samples / n_ranks)
+        st = self.topo.rank * block + batch_idx
+        if st >= len(self.sample_indices):
+            return []
+        return self.sample_indices[st : st + 1]

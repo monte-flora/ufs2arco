@@ -18,6 +18,7 @@ _recognized = {
     "aws_mrms_archive": "AWSMRMSArchive",
     "aws_mrms_patches": "AWSMRMSPatches",
     "aws_hrrr_patches": "AWSHRRRPatches",
+    "aws_hrrr_patches_grib2": "AWSHRRRPatchesGrib2",
 }
 
 # Lazy imports: source classes are only imported when accessed by name.
@@ -37,6 +38,7 @@ _lazy_imports = {
     "AWSMRMSArchive": ".aws_mrms_archive",
     "AWSMRMSPatches": ".aws_mrms_patches",
     "AWSHRRRPatches": ".aws_hrrr_patches",
+    "AWSHRRRPatchesGrib2": ".aws_hrrr_patches_grib2",
 }
 
 
