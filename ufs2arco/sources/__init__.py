@@ -14,6 +14,7 @@ _recognized = {
     "aws_graf_archive": "AWSGRAFArchive",
     "aws_graf_regridded_archive": "AWSGRAFRegriddedArchive",
     "aws_graf_regridded_patches": "AWSGRAFRegriddedPatchesArchive",
+    "local_graf_regridded_operational": "LocalGRAFRegriddedOperational",
     "wofscast_archive": "WoFSCastArchive",
 }
 
@@ -30,6 +31,7 @@ _lazy_imports = {
     "AWSGRAFArchive": ".aws_graf_reforecast",
     "AWSGRAFRegriddedArchive": ".aws_graf_reforecast_regridded",
     "AWSGRAFRegriddedPatchesArchive": ".aws_graf_regridded_patches",
+    "LocalGRAFRegriddedOperational": ".local_graf_regridded_operational",
     "WoFSCastArchive": ".wofscast",
 }
 
