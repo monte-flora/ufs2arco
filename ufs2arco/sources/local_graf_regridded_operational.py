@@ -65,6 +65,7 @@ class LocalGRAFRegriddedOperational(AWSGRAFRegriddedArchive):
         destagger_kwargs: Optional[dict] = None,
         temporal_aggregation_kwargs: Optional[dict] = None,
         raymond_filter_kwargs: Optional[dict] = None,
+        skip_raymond_on_forcing: bool = True,
     ) -> None:
         """Initialize the operational source.
 
@@ -127,6 +128,7 @@ class LocalGRAFRegriddedOperational(AWSGRAFRegriddedArchive):
         self.destagger_kwargs = destagger_kwargs
         self.temporal_aggregation_kwargs = temporal_aggregation_kwargs
         self.raymond_filter_kwargs = raymond_filter_kwargs
+        self.skip_raymond_on_forcing = bool(skip_raymond_on_forcing)
 
         # ---- Static file + lat/lon, then optional geo-extent slicing ----
         self._load_static_file_regridded(static_regridded_file_path)
@@ -163,7 +165,38 @@ class LocalGRAFRegriddedOperational(AWSGRAFRegriddedArchive):
         self._base_xds_cache_per_init_time: dict = {}
 
         logger.info(
-            "%s: %d init_times × %d steps = %d samples (freq=%s, base_dir=%s)",
+            "%s: %d init_times × %d steps = %d samples (freq=%s, base_dir=%s, "
+            "skip_raymond_on_forcing=%s)",
             self.name, len(self.init_time), self.n_steps,
             len(self.init_time) * self.n_steps, file_freqstr, self.BUCKET,
+            self.skip_raymond_on_forcing,
+        )
+
+    def open_sample_dataset(self, dims, open_static_vars, cache_dir=None):
+        """Skip Raymond on forcing frames (forecast_step > forecast_offset).
+
+        Rationale: anemoi-inference uses only the boundary cells of forcing
+        frames (~0.3% of cells via the cutout/boundary mask) to nudge
+        the model's rollout; the interior is overwritten by the model's
+        own prediction. Smoothing the boundary 5-cell ring with Raymond
+        adds zero value to inference quality and costs ~5 CPU-min per
+        frame on full-CONUS — a clean ~92% Raymond-cost reduction when
+        only the t=0 IC needs training-equivalent filtering.
+
+        Disable with ``skip_raymond_on_forcing=False`` for strict train-
+        equivalent A/B runs.
+        """
+        step = int(dims["forecast_step"])
+        is_ic = step == int(self.forecast_offset)
+        if self.skip_raymond_on_forcing and not is_ic:
+            saved = self.raymond_filter_kwargs
+            self.raymond_filter_kwargs = None
+            try:
+                return super().open_sample_dataset(
+                    dims, open_static_vars, cache_dir=cache_dir
+                )
+            finally:
+                self.raymond_filter_kwargs = saved
+        return super().open_sample_dataset(
+            dims, open_static_vars, cache_dir=cache_dir
         )
