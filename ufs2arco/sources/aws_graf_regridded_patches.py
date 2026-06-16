@@ -161,6 +161,18 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
         self.patch_size_km = float(patch_size_km)
         self.patch_size_pix = int(round(self.patch_size_km / _PIXEL_KM))
 
+        # Native-5-min output mode: when file_freqstr is "05m" AND we are NOT
+        # temporally-aggregating, each frame is one 5-min source slice. This
+        # changes (a) the stride in _compute_valid_times below and (b) the
+        # time-selection path in open_sample_dataset.
+        # `stored_freq` is read by the Anemoi target (with getattr fallback to
+        # the class-level STORED_FREQ) when writing the zarr's `frequency`
+        # attribute.
+        self._is_native_5min = (
+            file_freqstr == "05m" and temporal_aggregation_kwargs is None
+        )
+        self.stored_freq = "05m" if self._is_native_5min else "15m"
+
         # ---- Build our own init_time list from manifest (ignore init_times arg) ----
         self.init_time = sorted(self.manifest_by_init.keys())
         self._init_time_dt_map = {
@@ -273,8 +285,13 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
                 self.trajectory_id_dict[traj_id_str] = traj_id_int
 
                 start_off_td = pd.Timedelta(minutes=int(entry["start_offset_min"]))
+                # Stride per frame: 5 min for native-5-min output, 15 min
+                # otherwise (15-min-cadence output regardless of whether the
+                # source files are 5- or 15-min — the 15-min mode aggregates
+                # over 3 source frames per output frame).
+                step_min = 5 if self._is_native_5min else 15
                 for f in range(self.n_frames_per_sample):
-                    vt = init_dt + start_off_td + pd.Timedelta(minutes=15 * f)
+                    vt = init_dt + start_off_td + pd.Timedelta(minutes=step_min * f)
                     all_valid_times.append(vt)
                     all_traj_ids.append(traj_id_int)
 
@@ -379,15 +396,20 @@ class AWSGRAFRegriddedPatchesArchive(AWSGRAFRegriddedArchive):
 
         valid_time = self.get_valid_time(xds, **dims)
 
-        # Time index: 15-min cadence for forecast_step enumeration. For
-        # 5m files, the parent's select_time is able to pick the right
-        # 5-min frames that correspond to this 15-min output window
-        # (via TIMESTEP_RATIO in the grandparent). Here we convert our
-        # flat forecast_step into the case's lead-time offset in 15-min
-        # multiples and delegate to select_time.
+        # Time index: convert our flat forecast_step into the case's
+        # lead-time offset, then delegate to the appropriate selector.
+        # - Native 5-min output: pick a single 5-min frame at the exact
+        #   (start_off_min + frame_offset*5) lead-time.
+        # - 15-min output (default; also covers the 5m-files-aggregated-to-15m
+        #   path): the existing select_time handles both source freqs via
+        #   TIMESTEP_RATIO + temporal_aggregation_kwargs.
         start_off_min = int(entry["start_offset_min"])
-        time_offset_15m = (start_off_min // 15) + frame_offset
-        xds = self.select_time(xds, time_offset_15m)
+        if self._is_native_5min:
+            time_offset_5m = (start_off_min // 5) + frame_offset
+            xds = self.select_time_single_5min(xds, time_offset_5m)
+        else:
+            time_offset_15m = (start_off_min // 15) + frame_offset
+            xds = self.select_time(xds, time_offset_15m)
 
         # Patch slice
         y_slice, x_slice = self._patch_yx_slice(entry["lat_c"], entry["lon_c"])

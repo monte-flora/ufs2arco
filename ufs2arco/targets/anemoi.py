@@ -275,8 +275,11 @@ class Anemoi(Target):
             "resolution": str(self.resolution),
             "start_date": self.start_date,
             "end_date": self.end_date,
-            # Monte: hardcoded!
-            "frequency": self.source.STORED_FREQ, 
+            # Read instance attr if the source provides it (e.g., patches
+            # source in native-5-min mode), else fall back to class-level
+            # STORED_FREQ. Lets a single source class emit different
+            # frequencies based on instance config.
+            "frequency": getattr(self.source, "stored_freq", self.source.STORED_FREQ),
             "statistics_start_date": self.statistics_start_date,
             "statistics_end_date": self.statistics_end_date,
         }
