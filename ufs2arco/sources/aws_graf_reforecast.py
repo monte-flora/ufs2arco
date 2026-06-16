@@ -475,14 +475,19 @@ class AWSGRAFArchive(Source):
         if self.file_freqstr == "15m":
             xds = xds.isel(time=[forecast_step])
         else:
-            # For the temporal aggregation of the precipitation fields 
+            # For the temporal aggregation of the precipitation fields
             # we want the 15-min accumulation since the previous time step.
-            # However, GRAF precip buckets are accumulated since the previous 
-            # time step, so we do not include the first 5-min timestep. 
+            # However, GRAF precip buckets are accumulated since the previous
+            # time step, so we do not include the first 5-min timestep.
             time_idx_rng = self.get_5m_steps(forecast_step)
-            xds = xds.isel(time = time_idx_rng) 
-            
+            xds = xds.isel(time = time_idx_rng)
+
         return xds
+
+    def select_time_single_5min(self, xds: xr.Dataset, step_5min: int):
+        # Native 5-min selection: pick exactly one 5-min frame, no aggregation
+        # window. Used by output_freqstr="05m" mode in the patches source.
+        return xds.isel(time=[step_5min])
     
     def get_nan_xds(self, xds : xr.Dataset)->xr.Dataset:
         # Performance update: Create new variables from coords/shapes only
