@@ -151,26 +151,28 @@ class AWSGRAFRegriddedArchive(AWSGRAFArchive):
         self._base_xds_cache_per_init_time = {}
 
     def _load_static_file_regridded(self, static_regridded_file_path):
-        """Load pre-regridded static vars and 2D lat/lon from zarr."""
-        # Load static vars from the pre-regridded netCDF
+        """Load pre-regridded static vars and 2D lat/lon from the local netCDF.
+
+        The local pre-regridded static netCDF already contains `lat` and `lon`
+        on the same (y, x) grid as the per-case zarrs (verified bit-identical).
+        Reading both static_vars AND lat/lon from this single Lustre netCDF
+        eliminates a per-rank S3 read of the first case's zarr — which at
+        576-rank concurrency hits S3 hot-spotting (~20% of ranks fail with
+        GroupNotFoundError when all read the same key simultaneously). The
+        local Lustre netCDF handles concurrent reads gracefully.
+        """
+        # Single open of the local netCDF for BOTH static_vars and lat/lon.
         self.static_vars = {}
-        if self.static_variables:
-            with netCDF4.Dataset(static_regridded_file_path, "r") as static_ds:
+        with netCDF4.Dataset(static_regridded_file_path, "r") as static_ds:
+            if self.static_variables:
                 for v in self.static_variables:
                     name = self.STATIC_VAR_RENAMER.get(v, v)
                     vals = np.array(static_ds.variables[v][:])
                     self.static_vars[name] = (["y", "x"], vals)
                     self.variables.append(name)
 
-        # Load 2D lat/lon from the first case's zarr file
-        # (all cases have identical lat/lon grids)
-        first_case = self.init_time[0]
-        zarr_path = f"{self.BUCKET}{first_case}/mpasout_{self.file_freqstr}.zarr"
-        ds = xr.open_zarr(zarr_path, consolidated=False, storage_options=self._storage_options)
-
-        lat = ds["lat"].values  # (y, x)
-        lon = ds["lon"].values  # (y, x)
-        ds.close()
+            lat = np.array(static_ds.variables["lat"][:])  # (y, x)
+            lon = np.array(static_ds.variables["lon"][:])  # (y, x)
 
         # Convert negative longitude to 360° convention
         lon = np.where(lon < 0, lon + 360.0, lon)
